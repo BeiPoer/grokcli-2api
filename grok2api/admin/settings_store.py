@@ -10,6 +10,7 @@ import secrets
 import threading
 import time
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from grok2api.config import ACCOUNT_MODE, ADMIN_PASSWORD, DATA_DIR, SETTINGS_FILE
 
@@ -1858,6 +1859,9 @@ _REG_CONFIG_KEYS = (
     "concurrency",
     "stagger_ms",
     "probe_delay_sec",
+    "remote_import_enabled",
+    "remote_import_url",
+    "remote_import_password",
 )
 
 _REG_SECRET_KEYS = frozenset(
@@ -1869,6 +1873,7 @@ _REG_SECRET_KEYS = frozenset(
         "cfmail_api_key",
         "yescaptcha_key",
         "proxy_password",
+        "remote_import_password",
     }
 )
 
@@ -1901,6 +1906,26 @@ def _mask_secret(value: str | None) -> str:
     if len(s) <= 8:
         return "****"
     return f"{s[:4]}…{s[-4:]}"
+
+
+def normalize_remote_import_url(value: str | None) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if "://" not in raw:
+        raw = f"https://{raw}"
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return ""
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        return ""
+    path = parsed.path.rstrip("/")
+    for suffix in ("/admin/api", "/admin"):
+        if path.endswith(suffix):
+            path = path[: -len(suffix)]
+            break
+    return urlunsplit((parsed.scheme.lower(), parsed.netloc, path, "", "")).rstrip("/")
 
 
 def _env_registration_defaults() -> dict[str, Any]:
@@ -2073,6 +2098,21 @@ def _normalize_registration_config(
         if key in src:
             return str(src.get(key) or "").strip().lstrip("@").strip(".")[:max_len]
         return str(env.get(key, "") or "").strip().lstrip("@").strip(".")[:max_len]
+
+    remote_enabled = src.get("remote_import_enabled", False)
+    cfg["remote_import_enabled"] = (
+        remote_enabled
+        if isinstance(remote_enabled, bool)
+        else str(remote_enabled).strip().lower() in {"1", "true", "yes", "on"}
+    )
+    cfg["remote_import_url"] = normalize_remote_import_url(
+        _pick_str("remote_import_url", 2048, allow_env=False)
+    )
+    cfg["remote_import_password"] = (
+        str(src.get("remote_import_password") or "")[:128]
+        if "remote_import_password" in src
+        else ""
+    )
 
     legacy_base_url = _pick_str("base_url", 256)
     cfg["moemail_base_url"] = _pick_str("moemail_base_url", 256)
@@ -2416,7 +2456,8 @@ def set_registration_config(
             continue
         val = patch.get(key)
         if key in _REG_SECRET_KEYS:
-            s = "" if val is None else str(val).strip()
+            raw_secret = "" if val is None else str(val)
+            s = raw_secret if key == "remote_import_password" else raw_secret.strip()
             # Masked UI value → keep previous secret.
             if _is_masked_secret(s):
                 if key in current_stored and current_stored.get(key):
@@ -2426,7 +2467,11 @@ def set_registration_config(
             # - active provider key / active api_key → clear (user deleted + saved)
             # - inactive provider keys → keep previous (field not shown/edited)
             if not s:
-                is_active_secret = key in {"api_key", active_key_slot}
+                is_active_secret = key in {
+                    "api_key",
+                    active_key_slot,
+                    "remote_import_password",
+                }
                 if is_active_secret:
                     base[key] = ""
                 elif key in current_stored and current_stored.get(key):
@@ -2527,6 +2572,15 @@ def set_registration_config(
             base[bslot] = current_stored.get(bslot) or ""
 
     cfg = _normalize_registration_config(base, merge_env=False)
+    if str(base.get("remote_import_url") or "").strip() and not cfg.get(
+        "remote_import_url"
+    ):
+        raise ValueError("线上项目地址无效，仅支持 http:// 或 https://")
+    if cfg.get("remote_import_enabled"):
+        if not cfg.get("remote_import_url"):
+            raise ValueError("启用远端入池时必须填写线上项目地址")
+        if not cfg.get("remote_import_password"):
+            raise ValueError("启用远端入池时必须填写线上管理员密码")
     # Drop empty optional strings to keep the row small — except domains/keys/urls:
     # empty is a real "cleared" value and must stay in DB so env cannot revive it.
     keep_empty = {
@@ -2549,6 +2603,8 @@ def set_registration_config(
         "proxy_username",
         "proxy_password",
         "proxy_strategy",
+        "remote_import_url",
+        "remote_import_password",
     }
     cleaned = {
         k: v
@@ -2567,6 +2623,9 @@ def set_registration_config(
     # Always persist active + per-provider base URLs (including empty after clear).
     for k in ("base_url", "moemail_base_url", "cfmail_base_url"):
         cleaned[k] = str(cfg.get(k) or "").strip().rstrip("/")
+    cleaned["remote_import_enabled"] = bool(cfg.get("remote_import_enabled"))
+    cleaned["remote_import_url"] = str(cfg.get("remote_import_url") or "")
+    cleaned["remote_import_password"] = str(cfg.get("remote_import_password") or "")
 
     _set_setting_value("registration_config", cleaned)
     apply_registration_config_to_runtime(cleaned)
@@ -2822,6 +2881,8 @@ def resolve_registration_inputs(
         active_dom_slot,
         "api_key",
         active_key_slot,
+        "remote_import_url",
+        "remote_import_password",
     }
 
     for key in _REG_CONFIG_KEYS:
@@ -3303,8 +3364,8 @@ def update_runtime_settings(patch: dict[str, Any]) -> dict[str, Any]:
 
 def get_public_settings() -> dict[str, Any]:
     data = _load()
-    # Secrets stay full for admin session API (admin-auth only); UI masks display.
-    reg = get_registration_config(include_secrets=True)
+    # Registration secrets are masked because status is also used before login.
+    reg = get_registration_config(include_secrets=False)
     outbound = get_outbound_proxy_config(include_secrets=True)
     try:
         from grok2api.upstream.proxy_pool import outbound_pool_public_summary

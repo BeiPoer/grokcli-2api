@@ -26,7 +26,7 @@ ASSETS = {
 def main() -> None:
     manifest: dict[str, str] = {}
     for name, src in ASSETS.items():
-        data = src.read_bytes()
+        data = src.read_bytes().replace(b"\r\n", b"\n")
         h = hashlib.sha1(data).hexdigest()[:10]
         out = DIST / (
             f"{name[:-3]}.{h}.js" if name.endswith(".js") else f"{name[:-4]}.{h}.css"
@@ -34,10 +34,12 @@ def main() -> None:
         out.write_bytes(data)
         manifest[name] = f"/static/dist/{out.name}"
         print("built", name, "->", manifest[name])
-    (DIST / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    (DIST / "manifest.json").write_text(
+        json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+    )
 
     for path in sorted(ADMIN.glob("*.html")):
-        html = path.read_text()
+        html = path.read_text(encoding="utf-8")
         html = re.sub(
             r'href="/static/css/admin-antd\.css[^"]*"',
             f'href="{manifest["admin-antd.css"]}"',
@@ -62,7 +64,7 @@ def main() -> None:
                 f'src="{hashed}"',
                 html,
             )
-        path.write_text(html)
+        path.write_text(html, encoding="utf-8")
         print("html", path.name)
     print("OK")
 

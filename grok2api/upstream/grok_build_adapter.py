@@ -241,6 +241,152 @@ def _persist_registration_sso(
         return ""
 
 
+def _validated_remote_import_target(
+    base_url: str | None, password: str | None
+) -> dict[str, str]:
+    from grok2api.admin.settings_store import normalize_remote_import_url
+
+    base = normalize_remote_import_url(base_url)
+    secret = str(password or "")
+    if not base:
+        raise RuntimeError("线上项目地址无效，仅支持 http:// 或 https://")
+    if not secret:
+        raise RuntimeError("线上管理员密码未配置")
+    return {"base_url": base, "password": secret}
+
+
+def _registration_remote_import_target() -> dict[str, str] | None:
+    from grok2api.admin.settings_store import get_registration_config
+
+    cfg = get_registration_config(include_secrets=True)
+    if not cfg.get("remote_import_enabled"):
+        return None
+    return _validated_remote_import_target(
+        cfg.get("remote_import_url"), cfg.get("remote_import_password")
+    )
+
+
+def _remote_admin_json(
+    target: dict[str, str],
+    path: str,
+    *,
+    method: str = "GET",
+    payload: dict[str, Any] | None = None,
+    timeout: float = 30.0,
+    authenticate: bool = True,
+) -> dict[str, Any]:
+    import urllib.error
+    import urllib.request
+
+    body = None
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "grokcli-2api-registration",
+    }
+    if authenticate:
+        login = _remote_admin_json(
+            target,
+            "/admin/api/login",
+            method="POST",
+            payload={"password": target["password"]},
+            timeout=min(timeout, 10.0),
+            authenticate=False,
+        )
+        token = str(login.get("token") or "").strip()
+        if not token:
+            raise RuntimeError("线上项目登录成功但未返回管理会话")
+        headers["X-Admin-Token"] = token
+    if payload is not None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    url = f"{target['base_url']}{path}"
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=max(1.0, float(timeout))) as resp:
+            status = int(getattr(resp, "status", 200) or 200)
+            raw = resp.read(2 * 1024 * 1024).decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        status = int(getattr(e, "code", 500) or 500)
+        raw = e.read(8192).decode("utf-8", errors="replace")
+        detail = raw.strip()[:500] or str(e)
+        try:
+            parsed = json.loads(raw) if raw else {}
+            if isinstance(parsed, dict):
+                detail = str(parsed.get("detail") or parsed.get("error") or detail)[:500]
+        except Exception:
+            pass
+        if status == 401:
+            detail = (
+                "线上管理员密码错误"
+                if path == "/admin/api/login"
+                else "线上管理会话无效，请重试"
+            )
+        raise RuntimeError(f"远端请求失败 HTTP {status}: {detail}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"无法连接线上项目: {e.reason}") from e
+    except TimeoutError as e:
+        raise RuntimeError("连接线上项目超时") from e
+    if status < 200 or status >= 300:
+        raise RuntimeError(f"远端请求失败 HTTP {status}")
+    try:
+        data = json.loads(raw) if raw else {}
+    except json.JSONDecodeError as e:
+        raise RuntimeError("线上项目返回了无效 JSON") from e
+    if not isinstance(data, dict):
+        raise RuntimeError("线上项目返回格式无效")
+    return data
+
+
+def test_remote_import_target(
+    *, base_url: str | None = None, password: str | None = None
+) -> dict[str, Any]:
+    target = _validated_remote_import_target(base_url, password)
+    result = _remote_admin_json(target, "/admin/api/session", timeout=10.0)
+    if not result.get("authenticated"):
+        raise RuntimeError("线上项目未确认管理员身份")
+    return {
+        "ok": True,
+        "base_url": target["base_url"],
+        "message": "线上项目连接成功，管理员密码有效",
+    }
+
+
+def _remote_import_auth_payload(
+    import_payload: dict[str, Any], target: dict[str, str]
+) -> dict[str, Any]:
+    forwarded = dict(import_payload)
+    forwarded.pop("sso_backup_path", None)
+    result = _remote_admin_json(
+        target,
+        "/admin/api/accounts/import",
+        method="POST",
+        payload={"payload": forwarded, "merge": True},
+        timeout=45.0,
+    )
+    if not result.get("ok"):
+        raise RuntimeError(str(result.get("error") or "线上账号导入失败"))
+    return {
+        **result,
+        "remote": True,
+        "storage": "remote",
+        "remote_base_url": target["base_url"],
+    }
+
+
+def _remote_probe_account(
+    account_id: str, target: dict[str, str]
+) -> dict[str, Any]:
+    from urllib.parse import quote
+
+    return _remote_admin_json(
+        target,
+        f"/admin/api/accounts/{quote(str(account_id), safe='')}/probe",
+        method="POST",
+        payload={"auto_disable": True},
+        timeout=180.0,
+    )
+
+
 def _reg_redis() -> bool:
     try:
         from grok2api.store.redis_client import redis_enabled
@@ -472,6 +618,7 @@ def _session_task_log_payload(sess: dict[str, Any] | None) -> dict[str, Any]:
             "status": st,
             "error": s.get("error"),
             "imported_account_ids": list(s.get("imported_account_ids") or [])[:20],
+            "import_target": s.get("import_target"),
             "sub2api_push": s.get("sub2api_push"),
             "adapter_build": s.get("adapter_build") or ADAPTER_BUILD,
         },
@@ -3006,7 +3153,22 @@ def _run_registration(
             import_payload["register_password"] = reg_password
         if sso_backup_path:
             import_payload["sso_backup_path"] = sso_backup_path
-        import_result = accounts.import_auth_payload(import_payload, merge=True)
+        remote_target = _registration_remote_import_target()
+        if remote_target:
+            sess["import_target"] = {
+                "mode": "remote",
+                "base_url": remote_target["base_url"],
+            }
+            update(
+                "importing",
+                f"importing account into online project {remote_target['base_url']} "
+                f"[{ADAPTER_BUILD}]",
+                import_target=sess["import_target"],
+            )
+            import_result = _remote_import_auth_payload(import_payload, remote_target)
+        else:
+            sess["import_target"] = {"mode": "local"}
+            import_result = accounts.import_auth_payload(import_payload, merge=True)
         if not import_result.get("ok"):
             raise RuntimeError(
                 f"SSO account import failed: {import_result.get('error')}; "
@@ -3014,7 +3176,11 @@ def _run_registration(
             )
         # Registration import is durable PostgreSQL (accounts + account_pool).
         # auth.json is not written at runtime in hybrid mode (export-only).
-        if import_result.get("storage") and import_result.get("storage") != "postgres":
+        if (
+            not remote_target
+            and import_result.get("storage")
+            and import_result.get("storage") != "postgres"
+        ):
             print(
                 f"[grok-build-auth] WARN: import storage={import_result.get('storage')} "
                 f"(expected postgres). Check DATABASE_URL."
@@ -3041,7 +3207,7 @@ def _run_registration(
         # Controlled by settings → sub2api → auto_push_on_register.
         # Failures are recorded on the session but never fail registration.
         sub2api_push: dict[str, Any] | None = None
-        if imported_ids:
+        if imported_ids and not remote_target:
             try:
                 update(
                     "pushing_sub2api",
@@ -3152,13 +3318,16 @@ def _run_registration(
                 probe_delay_sec=delay,
             )
             try:
-                import grok2api.pool.model_health as model_health
-
                 for aid in imported_ids:
                     try:
-                        pr = model_health.probe_single_account(
-                            aid, None, auto_disable=True, source="register"
-                        )
+                        if remote_target:
+                            pr = _remote_probe_account(aid, remote_target)
+                        else:
+                            import grok2api.pool.model_health as model_health
+
+                            pr = model_health.probe_single_account(
+                                aid, None, auto_disable=True, source="register"
+                            )
                         detail = pr.get("result") if isinstance(pr, dict) else None
                         if not isinstance(detail, dict):
                             detail = pr if isinstance(pr, dict) else {}
@@ -3209,12 +3378,14 @@ def _run_registration(
         fail_n = int(sess["probe"]["fail"])
         update(
             "imported",
-            f"imported via sso_to_auth_json "
+            f"imported to {'online project' if remote_target else 'local pool'} "
+            f"via sso_to_auth_json "
             f"({len(imported_ids) or len(imported_rows)} account(s)); "
             f"probe ok={ok_n} fail={fail_n} "
             f"[{ADAPTER_BUILD}]",
             imported_account_ids=imported_ids,
             imported_accounts=imported_accounts,
+            import_target=sess.get("import_target"),
             probe=sess.get("probe"),
         )
         return

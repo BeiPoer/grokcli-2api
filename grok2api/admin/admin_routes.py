@@ -300,6 +300,9 @@ class EmailRegistrationBody(BaseModel):
         le=600,
         description="Seconds to wait after import before auto health probe (0=immediate)",
     )
+    remote_import_enabled: bool | None = None
+    remote_import_url: str | None = Field(default=None, max_length=2048)
+    remote_import_password: str | None = Field(default=None, max_length=128)
 
 
 class EmailRegistrationProxyTestBody(BaseModel):
@@ -390,6 +393,14 @@ class RegistrationConfigBody(BaseModel):
         le=600,
         description="Seconds to wait after import before auto health probe (0=immediate)",
     )
+    remote_import_enabled: bool | None = None
+    remote_import_url: str | None = Field(default=None, max_length=2048)
+    remote_import_password: str | None = Field(default=None, max_length=128)
+
+
+class RemoteRegistrationTargetBody(BaseModel):
+    remote_import_url: str | None = Field(default=None, max_length=2048)
+    remote_import_password: str | None = Field(default=None, max_length=128)
 
 
 class RefreshBody(BaseModel):
@@ -2041,6 +2052,9 @@ def _registration_cfg_from_body(body: EmailRegistrationBody | RegistrationConfig
         "concurrency": getattr(body, "concurrency", None),
         "stagger_ms": getattr(body, "stagger_ms", None),
         "probe_delay_sec": getattr(body, "probe_delay_sec", None),
+        "remote_import_enabled": getattr(body, "remote_import_enabled", None),
+        "remote_import_url": getattr(body, "remote_import_url", None),
+        "remote_import_password": getattr(body, "remote_import_password", None),
     }
 
 
@@ -2051,7 +2065,7 @@ async def get_email_registration_config(
 ):
     """Load protocol registration form config (DB + env defaults)."""
     require_admin(request, x_admin_token)
-    cfg = get_registration_config(include_secrets=True)
+    cfg = get_registration_config(include_secrets=False)
     return {
         "ok": True,
         "config": cfg,
@@ -2076,11 +2090,9 @@ async def put_email_registration_config(
 ):
     """Save protocol registration config to database (and apply to runtime)."""
     require_admin(request, x_admin_token)
+    patch = body.model_dump(exclude_unset=True)
     try:
-        cfg = set_registration_config(
-            body.model_dump(exclude_none=False),
-            replace=False,
-        )
+        set_registration_config(patch, replace=False)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:  # noqa: BLE001
@@ -2090,9 +2102,44 @@ async def put_email_registration_config(
         action="register.config_save",
         summary="保存协议注册配置",
         target_type="registration",
-        detail={"keys": [k for k, v in body.model_dump(exclude_none=False).items() if v not in (None, "")]},
+        detail={"keys": [k for k, v in patch.items() if v not in (None, "")]},
     )
-    return {"ok": True, "config": cfg, "message": "注册配置已保存到数据库"}
+    return {
+        "ok": True,
+        "config": get_registration_config(include_secrets=False),
+        "message": "注册配置已保存到数据库",
+    }
+
+
+@router.post("/accounts/register-email/remote-test")
+async def test_remote_registration_target(
+    body: RemoteRegistrationTargetBody,
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    require_admin(request, x_admin_token)
+    adapter = _require_register_adapter()
+    resolved = resolve_registration_inputs(
+        {
+            "remote_import_url": body.remote_import_url,
+            "remote_import_password": body.remote_import_password,
+        }
+    )
+    try:
+        result = adapter.test_remote_import_target(
+            base_url=resolved.get("remote_import_url"),
+            password=resolved.get("remote_import_password"),
+        )
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    audit_log(
+        request,
+        action="register.remote_test",
+        summary="测试线上入池目标",
+        target_type="registration",
+        target_id=str(resolved.get("remote_import_url") or "")[:300],
+    )
+    return result
 
 
 @router.post("/accounts/register-email")
@@ -2116,6 +2163,8 @@ async def start_email_registration(
     # Auto-persist: keep last used form values so next open works after restart.
     try:
         set_registration_config(resolved, replace=False)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception:
         pass
 
