@@ -246,6 +246,8 @@
       </select>
     </label>
   </div>
+  <div class="g2a-muted" style="margin:6px 0 2px">状态筛选</div>
+  <div id="acc-status-chips" class="g2a-toolbar" style="gap:6px;margin:0 0 0;flex-wrap:wrap"></div>
   <div id="acc-selection-info" class="g2a-muted" style="margin:8px 0 10px">—</div>
   <div id="accounts-empty" class="g2a-empty hidden" style="display:none">暂无账号，请设备码登录或导入 Token。</div>
   <div id="quota-summary" class="g2a-muted" style="margin-bottom:8px"></div>
@@ -284,34 +286,8 @@
 <section class="g2a-card">
   <div class="g2a-card-head">
     <div>
-      <h3>线上项目入池</h3>
-      <p>开启后，新注册账号仅写入线上实例；远端导入失败不会回退到本地账号池。</p>
-    </div>
-    <div class="g2a-actions">
-      <button class="g2a-btn g2a-btn-default" id="btn-test-remote-reg">测试连接</button>
-      <button class="g2a-btn g2a-btn-primary" id="btn-save-remote-reg">保存配置</button>
-    </div>
-  </div>
-  <div class="g2a-form-grid">
-    <div class="g2a-field">
-      <label class="g2a-check"><input type="checkbox" id="reg-remote-import-enabled" /> 启用线上入池</label>
-    </div>
-    <div class="g2a-field">
-      <label for="reg-remote-import-url">线上项目地址</label>
-      <input id="reg-remote-import-url" placeholder="https://grok.example.com" spellcheck="false" />
-    </div>
-    <div class="g2a-field">
-      <label for="reg-remote-import-password">线上管理员密码</label>
-      <input id="reg-remote-import-password" type="password" placeholder="管理员登录密码" autocomplete="new-password" />
-    </div>
-  </div>
-</section>
-
-<section class="g2a-card">
-  <div class="g2a-card-head">
-    <div>
       <h3>协议注册</h3>
-      <p>临时邮箱（MoeMail / YYDS）+ 过盾服务自动建号并导入当前配置的账号池。本地过盾以内联方式运行（无需填写 URL）；也可切换到 YesCaptcha 云端。</p>
+      <p>临时邮箱（MoeMail / YYDS）+ 过盾服务自动建号并导入账号池。本地过盾以内联方式运行（无需填写 URL）；也可切换到 YesCaptcha 云端。</p>
     </div>
     <div class="g2a-actions">
       <button class="g2a-btn g2a-btn-default" id="btn-save-reg">保存配置</button>
@@ -341,7 +317,7 @@
     </div>
     <div class="g2a-field">
       <label id="reg-domain-label">邮箱域名</label>
-      <input id="reg-domain" placeholder="留空则自动获取；YYDS 多个域名用逗号分隔" autocomplete="off" name="reg-domain" spellcheck="false" />
+      <input id="reg-domain" placeholder="留空则自动获取（YYDS/GPTMail/CF）" autocomplete="off" name="reg-domain" spellcheck="false" />
     </div>
     <div class="g2a-field">
       <label for="reg-captcha-provider">过盾方式</label>
@@ -512,6 +488,6 @@
   <script src="/static/dist/api.c4edde3d16.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/state.da9974e23b.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/auth.fa7b1e0e4d.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/core.65939cb6d8.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/core.9a10b92020.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
 </body>
 </html>
