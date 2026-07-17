@@ -4275,12 +4275,15 @@ async function pollRegSession() {
 
     // Fallback client-side probe for imported accounts missing backend probe.
     // Skip while stopping — no need to thrash the card with new probe lines mid-stop.
-    const importedIds = collectImportedAccountIds(sessions);
+    const fallbackSessions = sessions.filter(
+      (s) => String((s && s.import_target && s.import_target.mode) || "local").toLowerCase() !== "remote"
+    );
+    const importedIds = collectImportedAccountIds(fallbackSessions);
     const needProbe = importedIds.filter((id) => !regProbedIds.has(id));
-    const backendProbed = sessions.some(
+    const backendProbed = fallbackSessions.some(
       (s) => s && s.probe && (s.probe.count > 0 || (Array.isArray(s.probe.results) && s.probe.results.length))
     );
-    if (!regStopping && needProbe.length && !backendProbed && !regProbeRunning) {
+    if (finished && !regStopping && needProbe.length && !backendProbed && !regProbeRunning) {
       // Fire and continue polling; probe results append to log.
       // New registrations: wait probe_delay_sec before first health probe.
       probeImportedAccounts(needProbe, {
