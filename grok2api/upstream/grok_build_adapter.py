@@ -31,7 +31,7 @@ ROOT = Path(__file__).resolve().parents[2]
 GBA = ROOT / "grok-build-auth"
 DATA_DIR = ROOT / "data"
 REGISTER_SSO_DIR = DATA_DIR / "register_sso"
-ADAPTER_BUILD = "v1.9.81-reg-sso-account-persist"
+ADAPTER_BUILD = "v1.9.94-reg-px-pass-harden"
 # Newly registered accounts often need a short settle window before probe.
 REGISTER_PROBE_DELAY_SEC = float(
     os.environ.get("GROK2API_REG_PROBE_DELAY_SEC", "30") or 30
@@ -61,8 +61,17 @@ LOCAL_SOLVER_URL = (
 
 # Hard cap for multi-thread registration concurrency only (YesCaptcha + xAI rate limits).
 # Batch count is intentionally uncapped — only concurrency bounds parallelism.
-MAX_CONCURRENCY = int(os.environ.get("GROK2API_REG_MAX_CONCURRENCY", "10") or 10)
-DEFAULT_CONCURRENCY = int(os.environ.get("GROK2API_REG_CONCURRENCY", "3") or 3)
+# Keep low: each local-captcha worker can wait on Camoufox; 5+ browsers OOM.
+MAX_CONCURRENCY = int(os.environ.get("GROK2API_REG_MAX_CONCURRENCY", "4") or 4)
+DEFAULT_CONCURRENCY = int(os.environ.get("GROK2API_REG_CONCURRENCY", "2") or 2)
+# Hard cap when captcha_provider=local (Camoufox is ~200–400MB per browser).
+try:
+    LOCAL_CAPTCHA_MAX_CONCURRENCY = max(
+        1,
+        min(4, int(os.environ.get("GROK2API_REG_LOCAL_CONCURRENCY", "2") or 2)),
+    )
+except (TypeError, ValueError):
+    LOCAL_CAPTCHA_MAX_CONCURRENCY = 2
 
 # When captcha_provider=local, registration must wait for the inline Turnstile
 # Solver HTTP to answer before spawning workers. Prevents "already running but
@@ -91,8 +100,8 @@ try:
     _GLOBAL_REG_INFLIGHT_MAX = max(
         1,
         min(
-            32,
-            int(os.environ.get("GROK2API_REG_GLOBAL_INFLIGHT", "6") or 6),
+            8,
+            int(os.environ.get("GROK2API_REG_GLOBAL_INFLIGHT", "3") or 3),
         ),
     )
 except (TypeError, ValueError):
@@ -168,27 +177,30 @@ def _release_reg_admission_once(flag: dict[str, bool]) -> None:
 REG_BATCH_RUNNER_LOCK_TTL = int(os.environ.get("GROK2API_REG_RUNNER_LOCK_TTL", "90") or 90)
 # How many jobs may be pre-created (mailbox + session) beyond the live concurrency
 # cap. Keep small so stop/cancel doesn't waste dozens of mailboxes.
-REG_PREFETCH_SLOTS = int(os.environ.get("GROK2API_REG_PREFETCH_SLOTS", "1") or 1)
+REG_PREFETCH_SLOTS = int(os.environ.get("GROK2API_REG_PREFETCH_SLOTS", "0") or 0)
 try:
+    # Default 25s so dead runners / orphan mid-captcha sessions are healed faster
+    # without thrashing healthy workers (was 45s → felt "stuck" for a minute+).
     REG_WATCHDOG_SEC = max(
-        15.0,
+        10.0,
         min(
             600.0,
-            float(os.environ.get("GROK2API_REG_WATCHDOG_SEC", "45") or 45),
+            float(os.environ.get("GROK2API_REG_WATCHDOG_SEC", "25") or 25),
         ),
     )
 except (TypeError, ValueError):
-    REG_WATCHDOG_SEC = 45.0
+    REG_WATCHDOG_SEC = 25.0
 try:
+    # Batch-level stale: resume dead runners sooner after process restart.
     REG_WATCHDOG_STALE_SEC = max(
         30.0,
         min(
             3600.0,
-            float(os.environ.get("GROK2API_REG_WATCHDOG_STALE_SEC", "180") or 180),
+            float(os.environ.get("GROK2API_REG_WATCHDOG_STALE_SEC", "90") or 90),
         ),
     )
 except (TypeError, ValueError):
-    REG_WATCHDOG_STALE_SEC = 180.0
+    REG_WATCHDOG_STALE_SEC = 90.0
 
 
 def _now() -> float:
@@ -244,9 +256,23 @@ def _persist_registration_sso(
 def _validated_remote_import_target(
     base_url: str | None, password: str | None
 ) -> dict[str, str]:
-    from grok2api.admin.settings_store import normalize_remote_import_url
+    from urllib.parse import urlsplit, urlunsplit
 
-    base = normalize_remote_import_url(base_url)
+    raw = str(base_url or "").strip()
+    if raw and "://" not in raw:
+        raw = f"https://{raw}"
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        parsed = None
+    base = ""
+    if parsed and parsed.scheme.lower() in {"http", "https"} and parsed.netloc:
+        path = parsed.path.rstrip("/")
+        for suffix in ("/admin/api", "/admin"):
+            if path.endswith(suffix):
+                path = path[: -len(suffix)]
+                break
+        base = urlunsplit((parsed.scheme.lower(), parsed.netloc, path, "", "")).rstrip("/")
     secret = str(password or "")
     if not base:
         raise RuntimeError("线上项目地址无效，仅支持 http:// 或 https://")
@@ -255,15 +281,17 @@ def _validated_remote_import_target(
     return {"base_url": base, "password": secret}
 
 
-def _registration_remote_import_target() -> dict[str, str] | None:
-    from grok2api.admin.settings_store import get_registration_config
-
-    cfg = get_registration_config(include_secrets=True)
-    if not cfg.get("remote_import_enabled"):
+def _registration_remote_import_target(
+    enabled: bool | str | int | None,
+    base_url: str | None,
+    password: str | None,
+) -> dict[str, str] | None:
+    if not (
+        enabled is True
+        or str(enabled or "").strip().lower() in {"1", "true", "yes", "on"}
+    ):
         return None
-    return _validated_remote_import_target(
-        cfg.get("remote_import_url"), cfg.get("remote_import_password")
-    )
+    return _validated_remote_import_target(base_url, password)
 
 
 def _remote_admin_json(
@@ -459,6 +487,67 @@ def _release_batch_runner(batch_id: str, token: str | None) -> None:
             pass
 
 
+
+def _resolve_mail_credentials(
+    *,
+    mail_provider: str | None = None,
+    moemail_api_key: str | None = None,
+    moemail_base_url: str | None = None,
+    domain: str | None = None,
+    reg_config: dict[str, Any] | None = None,
+) -> tuple[str, str, str, str]:
+    """Return (provider, api_key, base_url, domain) for mailbox create.
+
+    Adapter call sites historically pass a single moemail_api_key. When the
+    batch was started as YYDS/GPTMail, that field is already the active key
+    (set by Go merge / registration_service). Prefer explicit reg_config slots
+    when present so resume stays correct after process restart.
+    """
+    cfg = reg_config if isinstance(reg_config, dict) else {}
+    try:
+        from grok2api.upstream.moemail import normalize_mail_provider as _nmp
+
+        prov = _nmp(
+            mail_provider or cfg.get("mail_provider"),
+            base_url=str(moemail_base_url or cfg.get("moemail_base_url") or ""),
+        )
+    except Exception:
+        prov = str(mail_provider or cfg.get("mail_provider") or "moemail").strip().lower() or "moemail"
+
+    key = str(moemail_api_key or cfg.get("moemail_api_key") or "").strip()
+    base = str(moemail_base_url or cfg.get("moemail_base_url") or "").strip()
+    dom = str(domain if domain is not None else cfg.get("domain") or "").strip()
+
+    if prov == "yyds":
+        key = str(cfg.get("yyds_api_key") or key).strip()
+        if cfg.get("yyds_domain") not in (None, ""):
+            dom = str(cfg.get("yyds_domain") or "").strip()
+        base = ""  # fixed host in moemail.py
+    elif prov == "gptmail":
+        key = str(cfg.get("gptmail_api_key") or key).strip()
+        if cfg.get("gptmail_domain") not in (None, ""):
+            dom = str(cfg.get("gptmail_domain") or "").strip()
+        base = ""
+    elif prov == "cfmail":
+        key = str(cfg.get("cfmail_api_key") or key).strip()
+        if cfg.get("cfmail_domain") not in (None, ""):
+            dom = str(cfg.get("cfmail_domain") or "").strip()
+        base = str(cfg.get("cfmail_base_url") or base).strip()
+    elif prov == "tempmail":
+        # Free tier: no key. Optional Bearer key for Plus/Ultra.
+        key = str(cfg.get("tempmail_api_key") or key).strip()
+        if cfg.get("tempmail_domain") not in (None, ""):
+            dom = str(cfg.get("tempmail_domain") or "").strip()
+        base = ""  # fixed https://api.tempmail.lol
+    else:
+        if cfg.get("moemail_domain") not in (None, ""):
+            dom = str(cfg.get("moemail_domain") or "").strip()
+        base = str(cfg.get("moemail_base_url") or base).strip()
+        key = str(cfg.get("moemail_api_key") or key).strip()
+
+    return prov, key, base, dom
+
+
 def _snapshot_reg_config(
     *,
     captcha_provider: str,
@@ -472,6 +561,7 @@ def _snapshot_reg_config(
     concurrency: int,
     stagger_ms: int,
     mail_provider: str | None = None,
+    remote_import_target: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Config snapshot kept with the in-memory/Redis batch while it is running."""
     return {
@@ -487,6 +577,7 @@ def _snapshot_reg_config(
         "stagger_ms": stagger_ms,
         "local_solver_url": "http://127.0.0.1:5072",
         "mail_provider": (mail_provider or "moemail").strip().lower() or "moemail",
+        "_remote_import_target": dict(remote_import_target or {}),
     }
 
 
@@ -587,6 +678,123 @@ def _record_register_task(
         pass
 
 
+
+
+def _append_session_log(sess: dict[str, Any], status: str, message: str, *, max_lines: int = 28) -> None:
+    """Append a timestamped progress line for real-time admin registration log UI."""
+    try:
+        lines = list(sess.get("log_lines") or [])
+    except Exception:
+        lines = []
+    try:
+        ts = time.strftime("%H:%M:%S", time.localtime(float(_now())))
+    except Exception:
+        ts = time.strftime("%H:%M:%S")
+    st = str(status or "").strip() or "—"
+    msg = str(message or "").strip().replace("\n", " ")
+    if len(msg) > 160:
+        msg = msg[:160] + "…"
+    line = f"[{ts}] {st}: {msg}" if msg else f"[{ts}] {st}"
+    # Dedup consecutive identical status+message (ignore timestamp prefix).
+    # Also throttle high-frequency captcha poll slices ("waiting poll slice 1.0/2.0s")
+    # so Redis mirrors and UI stay cheap while still heartbeating updated_at via update().
+    if lines:
+        prev = str(lines[-1])
+        if len(prev) > 10 and prev[10:] == line[10:]:
+            return
+        # Collapse noisy poll-slice chatter: keep at most one every ~4s.
+        noisy = (
+            "waiting poll slice" in msg.lower()
+            or "still processing" in msg.lower()
+            or "poll slice" in msg.lower()
+        )
+        if noisy and len(prev) > 10:
+            prev_body = prev[10:]
+            if prev_body.startswith(f" {st}:") or f"] {st}:" in prev:
+                # Same status family — skip if last line is also noisy and recent.
+                try:
+                    last_noisy = (
+                        "waiting poll slice" in prev_body.lower()
+                        or "still processing" in prev_body.lower()
+                        or "poll slice" in prev_body.lower()
+                    )
+                except Exception:
+                    last_noisy = False
+                if last_noisy:
+                    # Replace last noisy line so UI shows latest progress without growth.
+                    lines[-1] = line
+                    sess["log_lines"] = lines[-max_lines:]
+                    sess["log"] = "\n".join(lines[-16:])
+                    sess["output_tail"] = sess["log"]
+                    return
+    lines.append(line)
+    if len(lines) > max_lines:
+        lines = lines[-max_lines:]
+    sess["log_lines"] = lines
+    # Compact tail for older UI paths that only read log / output_tail.
+    sess["log"] = "\n".join(lines[-16:])
+    sess["output_tail"] = sess["log"]
+
+
+def _throttle_task_log(
+    *,
+    task_id: str,
+    status: str,
+    summary: str,
+    progress_done: int = 0,
+    progress_total: int = 0,
+    finished: bool = False,
+    ok: bool | None = None,
+    detail: dict[str, Any] | None = None,
+    min_interval_sec: float = 1.5,
+    force: bool = False,
+) -> None:
+    """Throttle PG task_logs writes so progress is near-real-time without thrashing DB."""
+    tid = str(task_id or "").strip()
+    if not tid:
+        return
+    now = float(_now())
+    with _lock:
+        cache = getattr(_throttle_task_log, "_last", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            setattr(_throttle_task_log, "_last", cache)
+        prev = cache.get(tid) or {}
+        last_ts = float(prev.get("ts") or 0)
+        last_summary = str(prev.get("summary") or "")
+        last_status = str(prev.get("status") or "")
+        last_done = int(prev.get("done") or -1)
+        if (
+            not force
+            and not finished
+            and (now - last_ts) < float(min_interval_sec)
+            and last_status == str(status or "")
+            and last_done == int(progress_done or 0)
+            and last_summary == str(summary or "")[:500]
+        ):
+            return
+        cache[tid] = {
+            "ts": now,
+            "summary": str(summary or "")[:500],
+            "status": str(status or ""),
+            "done": int(progress_done or 0),
+        }
+        if len(cache) > 4000:
+            items = sorted(cache.items(), key=lambda kv: float((kv[1] or {}).get("ts") or 0))
+            for k, _ in items[: max(1, len(items) // 5)]:
+                cache.pop(k, None)
+    _record_register_task(
+        task_id=tid,
+        summary=summary,
+        status=status,
+        ok=ok,
+        progress_done=progress_done,
+        progress_total=progress_total,
+        finished=finished,
+        detail=detail,
+    )
+
+
 def _session_task_log_payload(sess: dict[str, Any] | None) -> dict[str, Any]:
     s = sess if isinstance(sess, dict) else {}
     st = str(s.get("status") or "done").lower() or "done"
@@ -621,6 +829,7 @@ def _session_task_log_payload(sess: dict[str, Any] | None) -> dict[str, Any]:
             "import_target": s.get("import_target"),
             "sub2api_push": s.get("sub2api_push"),
             "adapter_build": s.get("adapter_build") or ADAPTER_BUILD,
+            "log_tail": list(s.get("log_lines") or [])[-30:],
         },
     }
 
@@ -744,18 +953,79 @@ def _load_reg_batch(batch_id: str) -> dict[str, Any] | None:
 
 
 def _clean_old_sessions() -> None:
-    cutoff = _now() - 6 * 3600
+    """Bound in-process session memory during bulk registration.
+
+    Terminal sessions are dropped after a short TTL; unfinished keep longer.
+    Absolute cap prevents 500-session batches from retaining full log blobs.
+    """
+    now = _now()
+    try:
+        term_ttl = float(os.environ.get("GROK2API_REG_SESSION_TERM_TTL", "900") or 900)
+    except (TypeError, ValueError):
+        term_ttl = 900.0
+    try:
+        live_ttl = float(os.environ.get("GROK2API_REG_SESSION_LIVE_TTL", "21600") or 21600)
+    except (TypeError, ValueError):
+        live_ttl = 21600.0
+    try:
+        max_keep = int(os.environ.get("GROK2API_REG_SESSION_MAX", "80") or 80)
+    except (TypeError, ValueError):
+        max_keep = 80
+    max_keep = max(20, min(300, max_keep))
+    term_ttl = max(120.0, min(7200.0, term_ttl))
+    live_ttl = max(term_ttl, min(48 * 3600.0, live_ttl))
+
     for sid in list(_sessions.keys()):
         sess = _sessions.get(sid) or {}
-        if float(sess.get("updated_at") or 0) < cutoff:
+        updated = float(sess.get("updated_at") or sess.get("created_at") or 0)
+        st = str(sess.get("status") or "").lower()
+        terminal = st in _TERMINAL_STATUSES or bool(sess.get("finished"))
+        ttl = term_ttl if terminal else live_ttl
+        if updated and (now - updated) > ttl:
+            # Drop heavy fields first if still needed by UI via Redis.
             _sessions.pop(sid, None)
-            _mirror_reg_sess(sid, None)
+            # Keep Redis mirror for admin poll; local RAM is the OOM risk.
+            continue
+
+    # Absolute cap: keep newest max_keep; strip logs from older terminal rows first.
+    if len(_sessions) > max_keep:
+        items = sorted(
+            _sessions.items(),
+            key=lambda kv: float((kv[1] or {}).get("updated_at") or 0),
+            reverse=True,
+        )
+        keep = {sid for sid, _ in items[:max_keep]}
+        for sid in list(_sessions.keys()):
+            if sid in keep:
+                continue
+            sess = _sessions.get(sid) or {}
+            st = str(sess.get("status") or "").lower()
+            if st in _TERMINAL_STATUSES or bool(sess.get("finished")):
+                _sessions.pop(sid, None)
+            else:
+                # Live but over cap: strip bulky logs only.
+                if isinstance(sess, dict):
+                    sess.pop("log_lines", None)
+                    sess.pop("log", None)
+                    sess.pop("output_tail", None)
+                    sess.pop("auth_json", None)
 
 
 def _compact_session(sess: dict[str, Any]) -> dict[str, Any]:
-    out = dict(sess)
+    # Only JSON-safe public fields. Process-local objects (e.g. `_receiver`,
+    # `_client`) must never leak into FastAPI / admin responses.
+    out: dict[str, Any] = {}
+    for k, v in (sess or {}).items():
+        if not isinstance(k, str):
+            continue
+        if k.startswith("_"):
+            continue
+        if callable(v):
+            continue
+        out[k] = v
     out.pop("_client", None)
     out.pop("_oauth_client", None)
+    out.pop("_receiver", None)
     out.pop("password", None)
     out.pop("yescaptcha_key", None)
     # Prefer explicit imported ids; fall back to auth_json summary for UI/logs.
@@ -784,6 +1054,13 @@ def _compact_session(sess: dict[str, Any]) -> dict[str, Any]:
         out["imported_accounts"] = imported_accounts
     # Drop full auth payload from list/poll responses (secrets).
     out.pop("auth_json", None)
+    # Compact: keep only short tail for admin UI (bulk reg holds hundreds of sessions).
+    lines = list(out.get("log_lines") or [])
+    if len(lines) > 16:
+        out["log_lines"] = lines[-16:]
+    if out.get("log") and len(str(out.get("log"))) > 800:
+        out["log"] = str(out.get("log"))[-800:]
+        out["output_tail"] = out["log"]
     return out
 
 
@@ -1124,28 +1401,48 @@ def _make_email_receiver(
     domain: str | None = None,
     expiry_ms: int | None = None,
     mail_provider: str | None = None,
+    domain_index: int | None = None,
 ):
-    from grok2api.upstream.moemail import create_mailbox, fetch_messages, normalize_mail_provider
+    from grok2api.upstream.moemail import (
+        create_mailbox,
+        fetch_messages,
+        normalize_mail_provider,
+        pick_domain_from_list,
+        parse_domain_list,
+    )
     from grok2api.config import MOEMAIL_API_KEY, MOEMAIL_BASE_URL, MOEMAIL_DOMAIN, MOEMAIL_EXPIRY_MS
 
-    key = (api_key or MOEMAIL_API_KEY or "").strip()
-    if not key:
-        raise ValueError(
-            "Mail API key missing. Set GROK2API_MOEMAIL_API_KEY or pass api_key."
-        )
-    base = (base_url or MOEMAIL_BASE_URL).rstrip("/")
+    base = (base_url or MOEMAIL_BASE_URL or "").rstrip("/")
     prov = normalize_mail_provider(mail_provider, base_url=base)
-    # YYDS/GPTMail/CFMail: empty domain means provider-side auto/random pick.
-    # Never bleed MoeMail's MOEMAIL_DOMAIN (default example.com) into them.
-    if prov in {"yyds", "gptmail", "cfmail"}:
-        dom = (domain or "").strip().lstrip("@").strip(".")
+    key = (api_key or MOEMAIL_API_KEY or "").strip()
+    # GPTMail allows empty key (public gpt-test). YYDS/MoeMail/CF require a key.
+    if not key and prov not in {"tempmail"}:
+        raise ValueError(
+            f"Mail API key missing for provider={prov}. "
+            "Save the key in 协议注册配置 (each provider keeps its own key; TempMail.lol free needs none)."
+        )
+    # Multi-domain config (newlines/commas): rotate by domain_index in batch jobs.
+    # Empty list => provider auto-pick (YYDS/GPTMail/CF) or MOEMAIL_DOMAIN fallback.
+    domains = parse_domain_list(domain)
+    if domains:
+        if domain_index is not None:
+            dom = pick_domain_from_list(domain, index=domain_index, strategy="round_robin")
+        else:
+            dom = pick_domain_from_list(domain, strategy="random")
     else:
-        dom = (domain or MOEMAIL_DOMAIN or "").strip().lstrip("@").strip(".")
+        # YYDS/GPTMail/CFMail: empty domain means provider-side auto/random pick.
+        # Never bleed MoeMail's MOEMAIL_DOMAIN (default example.com) into them.
+        if prov in {"yyds", "gptmail", "cfmail", "tempmail"}:
+            dom = ""
+        else:
+            dom = (domain or MOEMAIL_DOMAIN or "").strip().lstrip("@").strip(".")
+
     # Random local-part only (no "grok-" brand prefix). Admin UI no longer exposes
     # a custom prefix field; ignore leftover config values for new mailboxes.
     pre = secrets.token_hex(5).lower()
 
     mailbox = create_mailbox(
+
         provider=prov,
         name=pre,
         domain=dom or None,
@@ -1177,6 +1474,8 @@ def _make_email_receiver(
                 default_base = "https://mail.chatgpt.org.uk"
             elif provider == "cfmail":
                 default_base = "https://temp-email-api.awsl.uk"
+            elif provider == "tempmail":
+                default_base = "https://api.tempmail.lol"
             else:
                 default_base = "https://moemail.521884.xyz"
             self.base_url = base_url or default_base
@@ -1203,15 +1502,34 @@ def _make_email_receiver(
                 if callable(should_cancel) and should_cancel():
                     raise _RegCancelled("cancelled while waiting for email code")
                 try:
-                    messages = fetch_messages(
-                        self.email_id,
-                        provider=self.provider,
-                        api_key=self.api_key,
-                        base_url=self.base_url,
-                        include_details=True,
-                        address=self.email,
-                        token=self.token or None,
-                    )
+                    messages = []
+                    # YYDS: prefer GET /v1/messages/next (long-poll + verificationCode).
+                    if self.provider == "yyds":
+                        try:
+                            from grok2api.upstream.moemail import yyds_wait_next_message
+
+                            nxt = yyds_wait_next_message(
+                                address=self.email,
+                                api_key=self.api_key,
+                                base_url=self.base_url,
+                                token=self.token or None,
+                                wait=min(15, max(1, int(deadline - time.time()))),
+                                email_id=self.email_id,
+                            )
+                            if nxt:
+                                messages = [nxt]
+                        except Exception:
+                            messages = []
+                    if not messages:
+                        messages = fetch_messages(
+                            self.email_id,
+                            provider=self.provider,
+                            api_key=self.api_key,
+                            base_url=self.base_url,
+                            include_details=True,
+                            address=self.email,
+                            token=self.token or None,
+                        )
                     for item in messages:
                         # Prefer xAI AAA-BBB codes first.
                         text = "\n".join(
@@ -1303,9 +1621,19 @@ def _proxy_pool(
     username: str | None = None,
     password: str | None = None,
 ) -> list[str]:
-    """Parse multi-line proxy text into full proxy URLs."""
+    """Parse multi-line proxy text into full proxy URLs.
+
+    Preference:
+      1) explicit proxy_text (+ optional user/pass)
+      2) env / outbound_proxy_config pool
+      3) auto-discovered peer proxy (privoxy etc.)
+    """
     try:
-        from grok2api.upstream.proxy_pool import parse_proxy_pool
+        from grok2api.upstream.proxy_pool import (
+            parse_proxy_pool,
+            get_outbound_proxy_source,
+            first_working_proxy,
+        )
 
         pool = parse_proxy_pool(
             proxy_text,
@@ -1315,6 +1643,22 @@ def _proxy_pool(
         )
         if pool:
             return pool
+        # When registration form proxy is empty, reuse outbound pool text/auth.
+        src = get_outbound_proxy_source() or {}
+        if src.get("enabled", True):
+            pool = list(src.get("pool") or [])
+            if not pool:
+                pool = parse_proxy_pool(
+                    src.get("text"),
+                    username=src.get("username"),
+                    password=src.get("password"),
+                    fallback_env=False,
+                )
+            if pool:
+                return pool
+        auto = first_working_proxy()
+        if auto:
+            return [auto]
     except Exception:
         pass
     # Fallback: treat as single proxy via classic normalizer.
@@ -1356,6 +1700,7 @@ def _prepare_registration_session(
     domain: str | None = None,
     expiry_ms: int | None = None,
     mail_provider: str | None = None,
+    remote_import_target: dict[str, str] | None = None,
     batch_id: str | None = None,
     batch_index: int | None = None,
     batch_total: int | None = None,
@@ -1373,6 +1718,7 @@ def _prepare_registration_session(
             domain=domain,
             expiry_ms=expiry_ms,
             mail_provider=mail_provider,
+            domain_index=batch_index,
         )
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "error": str(e)}
@@ -1399,6 +1745,7 @@ def _prepare_registration_session(
         "batch_id": batch_id,
         "batch_index": batch_index,
         "batch_total": batch_total,
+        "_remote_import_target": dict(remote_import_target or {}),
         # Keep receiver process-local only (not mirrored to Redis).
         "_receiver": receiver,
     }
@@ -1422,6 +1769,7 @@ def _start_one_registration(
     domain: str | None = None,
     expiry_ms: int | None = None,
     mail_provider: str | None = None,
+    remote_import_target: dict[str, str] | None = None,
     batch_id: str | None = None,
     batch_index: int | None = None,
     batch_total: int | None = None,
@@ -1437,6 +1785,7 @@ def _start_one_registration(
         domain=domain,
         expiry_ms=expiry_ms,
         mail_provider=mail_provider,
+        remote_import_target=remote_import_target,
         batch_id=batch_id,
         batch_index=batch_index,
         batch_total=batch_total,
@@ -1505,6 +1854,9 @@ def start_registration(
     concurrency: int | None = None,
     stagger_ms: int | None = None,
     probe_delay_sec: float | int | None = None,
+    remote_import_enabled: bool | str | int | None = None,
+    remote_import_url: str | None = None,
+    remote_import_password: str | None = None,
 ) -> dict[str, Any]:
     """Start one or many registration sessions (multi-thread).
 
@@ -1515,6 +1867,15 @@ def start_registration(
     ``proxy`` may be a single URL or a multi-line proxy pool. Each registration
     job picks one entry via ``proxy_strategy`` (round_robin / random / sticky).
     """
+    try:
+        remote_import_target = _registration_remote_import_target(
+            remote_import_enabled,
+            remote_import_url,
+            remote_import_password,
+        )
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": str(e)}
+
     try:
         ensure_xconsole()
     except Exception as e:  # noqa: BLE001
@@ -1621,6 +1982,10 @@ def start_registration(
     except (TypeError, ValueError):
         workers = DEFAULT_CONCURRENCY
     workers = max(1, min(workers, MAX_CONCURRENCY, n))
+    # Local Camoufox: never run more parallel registrations than local solver
+    # can safely host (each browser ≈ hundreds of MB).
+    if provider == "local":
+        workers = max(1, min(workers, LOCAL_CAPTCHA_MAX_CONCURRENCY, n))
 
     try:
         stagger = int(stagger_ms if stagger_ms is not None else 400)
@@ -1640,12 +2005,15 @@ def start_registration(
         _default_strat = "round_robin"
     proxy_strat = (proxy_strategy or _default_strat or "round_robin").strip().lower()
     proxy_val = _pick_proxy_from_pool(proxy_pool, strategy=proxy_strat, index=0)
-    try:
-        from grok2api.upstream.moemail import normalize_mail_provider as _norm_mail
-
-        mail_prov = _norm_mail(mail_provider, base_url=moemail_base_url)
-    except Exception:
-        mail_prov = (mail_provider or "moemail").strip().lower() or "moemail"
+    mail_prov, mail_key, mail_base, mail_dom = _resolve_mail_credentials(
+        mail_provider=mail_provider,
+        moemail_api_key=moemail_api_key,
+        moemail_base_url=moemail_base_url,
+        domain=domain,
+    )
+    moemail_api_key = mail_key
+    moemail_base_url = mail_base
+    domain = mail_dom
 
     # Single job — keep original response shape for UI compatibility.
     if n == 1:
@@ -1658,6 +2026,7 @@ def start_registration(
             domain=domain,
             expiry_ms=expiry_ms,
             mail_provider=mail_prov,
+            remote_import_target=remote_import_target,
         )
 
     batch_id = f"batch_{uuid.uuid4().hex[:12]}"
@@ -1675,6 +2044,7 @@ def start_registration(
         concurrency=workers,
         stagger_ms=stagger,
         mail_provider=mail_prov,
+        remote_import_target=remote_import_target,
     )
     reg_cfg["proxy_strategy"] = proxy_strat
     reg_cfg["proxy_pool_count"] = len(proxy_pool)
@@ -1695,6 +2065,7 @@ def start_registration(
         "fail_count": 0,
         "spawned": 0,
         "reg_config": reg_cfg,
+        "_remote_import_target": dict(remote_import_target or {}),
         "owner_pid": os.getpid(),
         "runner_alive": True,
         "cancel_requested": False,
@@ -1737,6 +2108,7 @@ def start_registration(
         domain=domain,
         expiry_ms=expiry_ms,
         mail_provider=mail_prov,
+        remote_import_target=remote_import_target,
     )
     if not started.get("ok"):
         return started
@@ -1784,6 +2156,7 @@ def _spawn_batch_runner(
     domain: str | None,
     expiry_ms: int | None,
     mail_provider: str | None = None,
+    remote_import_target: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Start the ThreadPool spawner for a batch (also used by resume/reclaim)."""
     bid = str(batch_id or "").strip()
@@ -1879,6 +2252,20 @@ def _spawn_batch_runner(
     proxy_strat = (proxy_strategy or _default_strat or "round_robin").strip().lower()
     proxy_snapshot = (proxy or "\n".join(proxy_pool) or "").strip()
     workers = max(1, min(int(concurrency or DEFAULT_CONCURRENCY), MAX_CONCURRENCY, remaining))
+    # captcha_provider may be passed in kwargs path; prefer batch reg_config.
+    try:
+        prov = str(captcha_provider or "").strip().lower()
+    except Exception:
+        prov = ""
+    if not prov:
+        try:
+            with _lock:
+                bb = _batches.get(str(batch_id or "")) or {}
+            prov = str((bb.get("reg_config") or {}).get("captcha_provider") or "").lower()
+        except Exception:
+            prov = ""
+    if prov == "local" or (not prov and str(os.environ.get("GROK2API_CAPTCHA_PROVIDER") or os.environ.get("CAPTCHA_PROVIDER") or "local").lower() == "local"):
+        workers = max(1, min(workers, LOCAL_CAPTCHA_MAX_CONCURRENCY, remaining))
     stagger = max(0, min(int(stagger_ms or 400), 10_000))
 
     with _lock:
@@ -1902,6 +2289,7 @@ def _spawn_batch_runner(
             concurrency=workers,
             stagger_ms=stagger,
             mail_provider=mail_provider,
+            remote_import_target=remote_import_target,
         )
         b["reg_config"]["proxy_strategy"] = proxy_strat
         b["reg_config"]["proxy_pool_count"] = len(proxy_pool)
@@ -1943,7 +2331,9 @@ def _spawn_batch_runner(
         next_i = 1
         in_flight: dict[Any, int] = {}
         prefetch = max(0, min(int(REG_PREFETCH_SLOTS), max(0, workers)))
-        max_inflight = max(1, workers + prefetch)
+        # Never queue more work than global admission + local captcha can take.
+        # Prefetch used to create extra mailboxes/sessions that pile up in RAM.
+        max_inflight = max(1, min(workers + prefetch, _GLOBAL_REG_INFLIGHT_MAX, workers + 1))
 
         def _batch_cancel_requested() -> bool:
             with _lock:
@@ -2049,6 +2439,7 @@ def _spawn_batch_runner(
                 domain=domain,
                 expiry_ms=expiry_ms,
                 mail_provider=mail_provider,
+                remote_import_target=remote_import_target,
                 batch_id=bid,
                 batch_index=i,
                 batch_total=int((_load_reg_batch(bid) or {}).get("count") or remaining),
@@ -2150,6 +2541,11 @@ def _spawn_batch_runner(
         def _note_result(idx: int, r: dict[str, Any] | None = None, exc: Exception | None = None) -> None:
             nonlocal finished, ok_n, fail_n
             finished += 1
+            if finished % 10 == 0:
+                try:
+                    _clean_old_sessions()
+                except Exception:
+                    pass
             if exc is not None:
                 fail_n += 1
                 errors.append(f"#{idx}: {exc}")
@@ -2183,6 +2579,29 @@ def _spawn_batch_runner(
                         f"inflight={len(in_flight)})"
                     )
                     _mirror_reg_batch(bid, dict(b))
+                    # Real-time batch progress into 任务日志 (throttled).
+                    try:
+                        _throttle_task_log(
+                            task_id=str(bid),
+                            status="running",
+                            summary=str(b.get("message") or f"协议注册批次 {bid}"),
+                            progress_done=int(finished or 0),
+                            progress_total=int(target_total or 0),
+                            finished=False,
+                            ok=None,
+                            detail={
+                                "batch_id": bid,
+                                "ok_count": ok_n,
+                                "fail_count": fail_n,
+                                "threads": workers,
+                                "inflight": len(in_flight),
+                                "phase": "progress",
+                                "adapter_build": ADAPTER_BUILD,
+                            },
+                            min_interval_sec=1.5,
+                        )
+                    except Exception:
+                        pass
 
         try:
             target_total = int((_load_reg_batch(bid) or {}).get("count") or remaining)
@@ -2212,6 +2631,28 @@ def _spawn_batch_runner(
                                     f"inflight={len(in_flight)})"
                                 )
                                 _mirror_reg_batch(bid, dict(bb))
+                                try:
+                                    _throttle_task_log(
+                                        task_id=str(bid),
+                                        status="running",
+                                        summary=str(bb.get("message") or f"协议注册批次 {bid}"),
+                                        progress_done=int(finished or 0),
+                                        progress_total=int(target_total or 0),
+                                        finished=False,
+                                        ok=None,
+                                        detail={
+                                            "batch_id": bid,
+                                            "ok_count": ok_n,
+                                            "fail_count": fail_n,
+                                            "threads": workers,
+                                            "inflight": len(in_flight),
+                                            "phase": "progress",
+                                            "adapter_build": ADAPTER_BUILD,
+                                        },
+                                        min_interval_sec=1.5,
+                                    )
+                                except Exception:
+                                    pass
 
                     if not in_flight:
                         break
@@ -2420,6 +2861,8 @@ def _run_registration(
 
     def update(status: str, message: str, **kwargs: Any) -> None:
         _refresh_cancel_from_redis()
+        write_task_now = False
+        task_payload: dict[str, Any] | None = None
         with _lock:
             cur = _sessions.get(sid) or sess
             # Batch-level cancel also aborts this worker.
@@ -2442,8 +2885,64 @@ def _run_registration(
             cur["message"] = message
             cur["updated_at"] = _now()
             cur.update(kwargs)
+            # Real-time progress lines for admin UI (mirrored via Redis).
+            try:
+                _append_session_log(cur, status, message)
+            except Exception:
+                pass
             _sessions[sid] = cur
             _mirror_reg_sess(sid, cur)
+            # Single-session jobs: stream progress into task_logs (throttled).
+            # Batch sessions are summarized on the batch row to avoid N*step spam.
+            if not bid:
+                write_task_now = True
+                st_l = str(status or "").lower()
+                terminal = st_l in _TERMINAL_STATUSES
+                task_payload = {
+                    "task_id": sid,
+                    "summary": str(message or status or f"协议注册 {email or sid}")[:500],
+                    "status": "running" if not terminal else st_l,
+                    "ok": (
+                        True
+                        if st_l in ("imported", "success", "completed", "done")
+                        else False
+                        if terminal
+                        else None
+                    ),
+                    "progress_done": 1
+                    if terminal and st_l in ("imported", "success", "completed", "done")
+                    else 0,
+                    "progress_total": 1,
+                    "finished": terminal,
+                    "detail": {
+                        "session_id": sid,
+                        "email": email or cur.get("email"),
+                        "status": st_l,
+                        "phase": "progress" if not terminal else "finished",
+                        "log_tail": list(cur.get("log_lines") or [])[-24:],
+                        "adapter_build": ADAPTER_BUILD,
+                        "error": cur.get("error"),
+                    },
+                    "force": terminal,
+                }
+        if write_task_now and task_payload:
+            try:
+                _throttle_task_log(
+                    task_id=str(task_payload["task_id"]),
+                    status=str(task_payload["status"]),
+                    summary=str(task_payload["summary"]),
+                    progress_done=int(task_payload["progress_done"] or 0),
+                    progress_total=int(task_payload["progress_total"] or 0),
+                    finished=bool(task_payload["finished"]),
+                    ok=task_payload.get("ok"),
+                    detail=task_payload.get("detail")
+                    if isinstance(task_payload.get("detail"), dict)
+                    else {},
+                    min_interval_sec=1.0,
+                    force=bool(task_payload.get("force")),
+                )
+            except Exception:
+                pass
 
     def _check_cancel() -> None:
         _refresh_cancel_from_redis()
@@ -2670,14 +3169,41 @@ def _run_registration(
             raise
         except Exception as captcha_err:
             _check_cancel()
-            alt_url = "https://accounts.x.ai/sign-up?redirect=cloud-console"
-            if website_url.rstrip("/") == alt_url.rstrip("/"):
-                alt_url = "https://accounts.x.ai/sign-up?redirect=grok-com"
-            update(
-                "solving_turnstile",
-                f"primary Turnstile failed ({captcha_err}); retry {alt_url}",
-            )
-            turnstile = _solve_turnstile(alt_url, premium=False)
+            _note_reg_pressure(f"primary turnstile: {captcha_err}", pause_sec=6)
+            alt_urls = [
+                "https://accounts.x.ai/sign-up?redirect=cloud-console",
+                "https://accounts.x.ai/sign-up?redirect=grok-com",
+                "https://accounts.x.ai/sign-up",
+            ]
+            # Prefer an alternate redirect that differs from the primary page.
+            alts = [u for u in alt_urls if u.rstrip("/") != website_url.rstrip("/")]
+            if not alts:
+                alts = alt_urls
+            last_cap_err: Exception | None = captcha_err
+            turnstile = None
+            for ai, alt_url in enumerate(alts[:2]):
+                update(
+                    "solving_turnstile",
+                    f"primary Turnstile failed ({captcha_err}); "
+                    f"retry alt {ai + 1}/{min(2, len(alts))} {alt_url}",
+                )
+                try:
+                    # First alt uses non-premium; second flips premium for remote.
+                    use_prem = (provider != "local") and (ai == 1)
+                    turnstile = _solve_turnstile(alt_url, premium=use_prem)
+                    if turnstile:
+                        website_url = alt_url  # keep subsequent refresh aligned
+                        break
+                except _RegCancelled:
+                    raise
+                except Exception as alt_err:  # noqa: BLE001
+                    last_cap_err = alt_err
+                    print(f"[grok-build-auth] alt turnstile failed: {alt_err}")
+                    continue
+            if not turnstile:
+                raise RuntimeError(
+                    f"Turnstile solve failed after primary+alt: {last_cap_err}"
+                ) from last_cap_err
         if not turnstile:
             raise RuntimeError("YesCaptcha returned empty Turnstile token")
         _check_cancel()
@@ -2749,55 +3275,117 @@ def _run_registration(
         update("registering", f"code received: {code}; verifying + creating immediately")
 
         # Prefer empty castle token (YesCaptcha cannot mint Castle fingerprints).
-        # Retry create_account once with a fresh Turnstile + fresh email code when
-        # the first flight is a structured hard error (expired code / turnstile).
-        create_attempts = 2
+        # Retry create_account with a fresh Turnstile (+ email code when needed)
+        # on structured hard errors (expired code / turnstile / CF hold / rate).
+        try:
+            create_attempts = int(
+                os.environ.get("GROK2API_REG_CREATE_ATTEMPTS", "3") or 3
+            )
+        except (TypeError, ValueError):
+            create_attempts = 3
+        create_attempts = max(2, min(5, create_attempts))
         res = None
         sc: list[str] = []
         rsc_body = ""
         rsc_preview = ""
         http_status = 0
         signup_err: str | None = None
+        need_fresh_email_code = False
+
+        def _signup_err_recoverable(err: str | None) -> bool:
+            low = str(err or "").lower()
+            if not low:
+                return False
+            needles = (
+                "turnstile",
+                "rate_limited",
+                "rate limit",
+                "captcha",
+                "account_signup_error",
+                "validation_error",
+                "invalid-validation-code",
+                "invalid_verification_code",
+                "access_denied",
+                "cf-",
+                "challenge",
+                "bot",
+                "perimeter",
+                "blocked",
+                "forbidden",
+                "temporarily",
+                "try again",
+                "wke=email:invalid-validation-code",
+            )
+            return any(n in low for n in needles)
+
+        def _signup_err_needs_new_code(err: str | None) -> bool:
+            low = str(err or "").lower()
+            return any(
+                n in low
+                for n in (
+                    "invalid-validation-code",
+                    "invalid_verification_code",
+                    "email validation code is invalid",
+                    "wke=email:invalid-validation-code",
+                    "expired",
+                )
+            )
+
         for ca in range(1, create_attempts + 1):
             if ca > 1:
-                # Full refresh path for invalid code / captcha failures.
+                # Full refresh path for invalid code / captcha / CF hold failures.
                 update(
                     "solving_turnstile",
-                    f"create_account hard error ({signup_err}); refreshing Turnstile+email code",
+                    f"create_account hard error ({signup_err}); "
+                    f"refreshing Turnstile"
+                    + ("+email code" if need_fresh_email_code else "")
+                    + f" (attempt {ca}/{create_attempts})",
                 )
+                # Brief cool-down so CF/Turnstile risk score can drop.
                 try:
-                    turnstile = _solve_turnstile(
-                        website_url, premium=(provider != "local")
+                    cool = float(
+                        os.environ.get("GROK2API_REG_CREATE_COOLDOWN_SEC", "2.5")
+                        or 2.5
                     )
+                except (TypeError, ValueError):
+                    cool = 2.5
+                cool = max(0.5, min(15.0, cool))
+                time.sleep(cool + 0.4 * (ca - 1))
+                try:
+                    # Alternate premium/non-premium across attempts for remote.
+                    use_prem = (provider != "local") and (ca % 2 == 1)
+                    turnstile = _solve_turnstile(website_url, premium=use_prem)
                 except Exception as captcha_err:  # noqa: BLE001
                     print(f"[grok-build-auth] turnstile refresh failed: {captcha_err}")
+                    _note_reg_pressure(f"create refresh captcha: {captcha_err}", pause_sec=12)
                     break
-                # New email code required after invalid-validation-code.
-                try:
-                    client.create_email_validation_code(email)
-                    update("waiting_email", "waiting for fresh xAI verification code")
+                if need_fresh_email_code:
+                    # New email code required after invalid-validation-code.
                     try:
-                        code = receiver.wait_for_code(
-                            timeout=120,
-                            should_cancel=_mail_should_cancel,
-                            poll_interval=1.0,
-                            on_tick=_mail_on_tick,
+                        client.create_email_validation_code(email)
+                        update("waiting_email", "waiting for fresh xAI verification code")
+                        try:
+                            code = receiver.wait_for_code(
+                                timeout=120,
+                                should_cancel=_mail_should_cancel,
+                                poll_interval=1.0,
+                                on_tick=_mail_on_tick,
+                            )
+                        except TypeError:
+                            code = receiver.wait_for_code(timeout=120)
+                        code = (
+                            str(code or "")
+                            .strip()
+                            .upper()
+                            .replace(" ", "")
+                            .replace("-", "")
                         )
-                    except TypeError:
-                        code = receiver.wait_for_code(timeout=120)
-                    code = (
-                        str(code or "")
-                        .strip()
-                        .upper()
-                        .replace(" ", "")
-                        .replace("-", "")
-                    )
-                    if len(code) != 6:
-                        raise RuntimeError(f"fresh email code invalid: {code!r}")
-                    update("registering", f"fresh code received: {code}")
-                except Exception as mail_err:  # noqa: BLE001
-                    print(f"[grok-build-auth] email code refresh failed: {mail_err}")
-                    break
+                        if len(code) != 6:
+                            raise RuntimeError(f"fresh email code invalid: {code!r}")
+                        update("registering", f"fresh code received: {code}")
+                    except Exception as mail_err:  # noqa: BLE001
+                        print(f"[grok-build-auth] email code refresh failed: {mail_err}")
+                        break
 
             # verify immediately before create_account (same second when possible)
             try:
@@ -2843,6 +3431,7 @@ def _run_registration(
             sess["create_account_ok_flag"] = bool(getattr(res, "ok", False))
             sess["create_account_set_cookies"] = len(sc)
             sess["create_account_error"] = signup_err
+            sess["create_account_attempt"] = ca
 
             # Persist full body for offline diagnosis (truncated).
             try:
@@ -2855,8 +3444,15 @@ def _run_registration(
                 pass
 
             if http_status != 200:
-                # Non-200 is terminal for this attempt; try once more only on 5xx.
-                if http_status >= 500 and ca < create_attempts:
+                # Non-200: retry on 403/408/429/5xx (CF hold / rate / upstream flake).
+                retryable_http = http_status in (403, 408, 409, 425, 429) or http_status >= 500
+                if retryable_http and ca < create_attempts:
+                    need_fresh_email_code = False
+                    _note_reg_pressure(
+                        f"create_account HTTP {http_status}",
+                        pause_sec=6 if http_status in (403, 429) else 4,
+                    )
+                    signup_err = signup_err or f"http_{http_status}"
                     continue
                 raise RuntimeError(
                     "create_account transport failed. "
@@ -2867,17 +3463,17 @@ def _run_registration(
 
             # Structured hard error: retry with fresh captcha when recoverable.
             if signup_err:
-                recoverable = any(
-                    x in str(signup_err).lower()
-                    for x in (
-                        "turnstile",
-                        "rate_limited",
-                        "rate limit",
-                        "captcha",
-                        "account_signup_error",
-                    )
-                )
+                recoverable = _signup_err_recoverable(signup_err)
                 if recoverable and ca < create_attempts:
+                    need_fresh_email_code = _signup_err_needs_new_code(signup_err)
+                    if any(
+                        x in str(signup_err).lower()
+                        for x in ("turnstile", "captcha", "rate_limited", "rate limit")
+                    ):
+                        _note_reg_pressure(
+                            f"create_account recoverable: {signup_err}",
+                            pause_sec=8,
+                        )
                     continue
                 raise RuntimeError(
                     "create_account rejected by xAI. "
@@ -3153,7 +3749,9 @@ def _run_registration(
             import_payload["register_password"] = reg_password
         if sso_backup_path:
             import_payload["sso_backup_path"] = sso_backup_path
-        remote_target = _registration_remote_import_target()
+        remote_target = sess.get("_remote_import_target")
+        if not isinstance(remote_target, dict) or not remote_target.get("base_url"):
+            remote_target = None
         if remote_target:
             sess["import_target"] = {
                 "mode": "remote",
@@ -3176,15 +3774,51 @@ def _run_registration(
             )
         # Registration import is durable PostgreSQL (accounts + account_pool).
         # auth.json is not written at runtime in hybrid mode (export-only).
-        if (
-            not remote_target
-            and import_result.get("storage")
-            and import_result.get("storage") != "postgres"
-        ):
+        storage = import_result.get("storage")
+        if not storage:
+            try:
+                storage = accounts._accounts_store_source()
+            except Exception:
+                storage = "unknown"
+        import_result["storage"] = storage
+        if not remote_target and storage != "postgres":
             print(
-                f"[grok-build-auth] WARN: import storage={import_result.get('storage')} "
-                f"(expected postgres). Check DATABASE_URL."
+                f"[grok-build-auth] WARN: import storage={storage} "
+                f"(expected postgres). Check DATABASE_URL / STORE_BACKEND."
             )
+        # Verify SSO cookie actually landed in durable store (re-read by id).
+        try:
+            imported_probe_ids = [
+                str(x.get("id"))
+                for x in (import_result.get("imported") or [])
+                if isinstance(x, dict) and x.get("id")
+            ]
+            if not remote_target and sso_cookie and imported_probe_ids:
+                from grok2api.pool.accounts import get_sso_value as _gsv
+                try:
+                    from grok2api.pool.auth_store import read_auth_entry as _rae
+                except Exception:
+                    _rae = None  # type: ignore[assignment]
+                for aid in imported_probe_ids[:5]:
+                    hit = _rae(aid) if _rae is not None else None
+                    payload = hit[1] if isinstance(hit, tuple) and len(hit) == 2 else None
+                    if not isinstance(payload, dict):
+                        continue
+                    if _gsv(payload):
+                        continue
+                    print(
+                        f"[grok-build-auth] WARN: account {aid} imported without SSO "
+                        f"in payload; rewriting sso field [{ADAPTER_BUILD}]"
+                    )
+                    fix = dict(payload)
+                    fix["sso"] = sso_cookie
+                    fix["sso_cookie"] = sso_cookie
+                    if reg_password:
+                        fix.setdefault("password", reg_password)
+                        fix.setdefault("register_password", reg_password)
+                    accounts.import_auth_payload(fix, merge=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[grok-build-auth] WARN: post-import SSO verify failed: {e}")
         imported_rows = [
             x for x in (import_result.get("imported") or []) if isinstance(x, dict)
         ]
@@ -3325,8 +3959,12 @@ def _run_registration(
                         else:
                             import grok2api.pool.model_health as model_health
 
+                            # New registrations must enter the live rotation pool.
+                            # Never auto-disable / free-usage-cool on the post-import
+                            # probe — free accounts often report free-usage-exhausted
+                            # on the first ping and were wrongly kicked out of 轮询.
                             pr = model_health.probe_single_account(
-                                aid, None, auto_disable=True, source="register"
+                                aid, None, auto_disable=False, source="register"
                             )
                         detail = pr.get("result") if isinstance(pr, dict) else None
                         if not isinstance(detail, dict):
@@ -3368,6 +4006,34 @@ def _run_registration(
                         "error": f"probe module error: {pe}"[:180],
                     }
                 )
+        # Ensure newly registered accounts stay enabled + not cooling even if a
+        # concurrent background health wave cooled them during import.
+        try:
+            import grok2api.pool.account_pool as account_pool
+            from grok2api.admin.settings_store import get_account_pool_meta, patch_account_pool_meta
+            for aid in imported_ids:
+                try:
+                    account_pool.clear_account_cooldown(aid)
+                except Exception:
+                    pass
+                try:
+                    meta = get_account_pool_meta(aid) or {}
+                    if isinstance(meta, dict) and meta.get("enabled") is False and not meta.get("disabled_for_quota"):
+                        patch_account_pool_meta(
+                            aid,
+                            {
+                                "enabled": True,
+                                "pool_status": "normal",
+                                "disabled_reason": None,
+                                "disabled_source": None,
+                                "cooldown_until": None,
+                                "cooldown_count": 0,
+                            },
+                        )
+                except Exception:
+                    pass
+        except Exception as rexc:
+            print(f"[grok-build-auth] WARN: post-register re-enable failed: {rexc}")
         sess["probe"] = {
             "count": len(probe_summaries),
             "ok": sum(1 for p in probe_summaries if p.get("ok")),
@@ -3476,10 +4142,10 @@ def reclaim_orphaned_registration_sessions(
         ttl = float(
             stale_sec
             if stale_sec is not None
-            else (os.environ.get("GROK2API_REG_STALE_SEC", "180") or 180)
+            else (os.environ.get("GROK2API_REG_STALE_SEC", "120") or 120)
         )
     except (TypeError, ValueError):
-        ttl = 180.0
+        ttl = 120.0
     ttl = max(30.0, min(ttl, 3600.0))
     now = _now()
     nonterm = _nonterminal_session_statuses()
@@ -3561,8 +4227,8 @@ def reclaim_orphaned_registration_sessions(
         batch_age = float(live.get("batch_age") or 1e18)
         # Live batch: only reclaim truly stalled sessions.
         # Local Turnstile is process-global serialized — under bulk load
-        # (600+ / concurrency 3-5) healthy sessions routinely wait several
-        # minutes for the lock. Keep a long grace for captcha/device stages.
+        # healthy sessions wait for the lock, but dead runners must free slots
+        # much sooner than the old 15min captcha grace (felt permanently stuck).
         long_wait_statuses = {
             "solving_turnstile",
             "waiting_email",
@@ -3570,20 +4236,23 @@ def reclaim_orphaned_registration_sessions(
             "probing",
             "creating_account",
             "registering",
+            "waiting_solver",
         }
         try:
             captcha_grace = float(
-                os.environ.get("GROK2API_REG_CAPTCHA_STALE_SEC", "900") or 900
+                os.environ.get("GROK2API_REG_CAPTCHA_STALE_SEC", "420") or 420
             )
         except (TypeError, ValueError):
-            captcha_grace = 900.0
-        captcha_grace = max(300.0, min(3600.0, captcha_grace))
+            captcha_grace = 420.0
+        # Floor 180s (one full local turnstile timeout + margin); cap 30min.
+        captcha_grace = max(180.0, min(1800.0, captcha_grace))
         if has_runner:
             if st in long_wait_statuses:
+                # Still alive runner: give captcha/email the full grace.
                 min_age = max(ttl, captcha_grace)
             else:
-                min_age = max(ttl, 180.0)
-        elif batch_age < max(ttl, 90.0) and str(live.get("batch_status") or "") in {
+                min_age = max(ttl, 120.0)
+        elif batch_age < max(ttl, 60.0) and str(live.get("batch_status") or "") in {
             "running",
             "starting",
             "stopping",
@@ -3593,14 +4262,15 @@ def reclaim_orphaned_registration_sessions(
             if st in long_wait_statuses:
                 min_age = max(ttl, captcha_grace)
             else:
-                min_age = max(ttl, 180.0)
+                min_age = max(ttl, 120.0)
         else:
-            # Dead batch: free slots sooner, but still give captcha a longer
-            # window so a brief runner restart does not mass-fail the queue.
+            # Dead batch / no runner: free slots ASAP so watchdog can resume.
+            # Previously captcha stages waited up to captcha_grace/2 (~7.5min)
+            # with runner_alive=False — the main "偶发性卡住" symptom.
             if st in long_wait_statuses:
-                min_age = min(max(120.0, captcha_grace / 2.0), captcha_grace)
+                min_age = min(max(75.0, ttl * 0.75), captcha_grace * 0.35, 180.0)
             else:
-                min_age = min(max(45.0, ttl / 2.0), ttl)
+                min_age = min(max(30.0, ttl / 3.0), 90.0)
         if age < min_age:
             continue
         msg = (
@@ -3784,8 +4454,19 @@ def resume_registration_batch(
         min_stagger = 600
     if provider == "local":
         stagger = max(stagger, min_stagger)
-    mail_provider = str(cfg.get("mail_provider") or "moemail").strip().lower()
+    mail_provider, mail_key, mail_base, mail_dom = _resolve_mail_credentials(
+        mail_provider=str(cfg.get("mail_provider") or "moemail"),
+        moemail_api_key=cfg.get("moemail_api_key"),
+        moemail_base_url=cfg.get("moemail_base_url"),
+        domain=cfg.get("domain"),
+        reg_config=cfg,
+    )
     proxy_strategy = str(cfg.get("proxy_strategy") or "round_robin").strip().lower()
+    remote_target = batch.get("_remote_import_target")
+    if not isinstance(remote_target, dict) or not remote_target.get("base_url"):
+        remote_target = cfg.get("_remote_import_target")
+    if not isinstance(remote_target, dict) or not remote_target.get("base_url"):
+        remote_target = None
 
     # Clear cancel so spawn is allowed.
     with _lock:
@@ -3811,12 +4492,13 @@ def resume_registration_batch(
         yescaptcha_key=key,
         proxy=proxy,
         proxy_strategy=proxy_strategy,
-        moemail_api_key=cfg.get("moemail_api_key"),
-        moemail_base_url=cfg.get("moemail_base_url"),
+        moemail_api_key=mail_key,
+        moemail_base_url=mail_base,
         prefix=cfg.get("prefix"),
-        domain=cfg.get("domain"),
+        domain=mail_dom,
         expiry_ms=cfg.get("expiry_ms"),
         mail_provider=mail_provider,
+        remote_import_target=remote_target,
     )
     out = {
         "ok": bool(spawned.get("ok")),
@@ -4044,8 +4726,9 @@ def _ensure_registration_watchdog() -> None:
         _reg_watchdog_started = True
 
     def _loop() -> None:
-        # Stagger first pass so app startup reclaim finishes first.
-        time.sleep(min(20.0, max(5.0, REG_WATCHDOG_SEC / 2.0)))
+        # First pass soon after startup so orphan mid-captcha sessions recover
+        # quickly after image restarts (was up to 20s of "stuck" UI).
+        time.sleep(min(8.0, max(3.0, REG_WATCHDOG_SEC / 3.0)))
         while True:
             try:
                 refreshed = _refresh_active_registration_ttls()
@@ -4312,13 +4995,9 @@ def get_registration_session(
     sess = _load_reg_sess(sid)
     if not sess:
         return None
-    out = dict(sess)
-    out.pop("_client", None)
-    out.pop("_oauth_client", None)
-    out.pop("password", None)
-    out.pop("yescaptcha_key", None)
-    if not include_auth_json:
-        out.pop("auth_json", None)
+    out = _compact_session(sess)
+    if include_auth_json and isinstance(sess.get("auth_json"), (dict, list)):
+        out["auth_json"] = sess.get("auth_json")
     return out
 
 
@@ -4491,22 +5170,39 @@ def get_registration_batch(batch_id: str) -> dict[str, Any] | None:
         return None
     sids = list(b.get("session_ids") or [])
     stats = _batch_stats(sids, batch=b)
-    # Keep response bounded for large batches: newest sessions first for UI.
-    MAX_BATCH_SESSIONS = 120
-    sessions = []
-    for s in sids[-MAX_BATCH_SESSIONS:]:
+    # Keep response bounded for large batches. Prefer LIVE (non-terminal) sessions
+    # so the admin log always shows in-flight progress, not only the newest finished ones.
+    MAX_BATCH_SESSIONS = 40
+    loaded: list[dict[str, Any]] = []
+    for s in sids:
         sess = _load_reg_sess(s)
         if sess:
-            sessions.append(_compact_session(sess))
-    # Prefer recency if timestamps available.
+            loaded.append(_compact_session(sess))
     try:
-        sessions.sort(
+        loaded.sort(
             key=lambda s: float(s.get("updated_at") or s.get("created_at") or 0),
             reverse=True,
         )
     except Exception:
         pass
-    out = {**b, **stats, "sessions": sessions}
+    nonterm = []
+    term = []
+    for sess in loaded:
+        st = str(sess.get("status") or "").strip().lower()
+        if st in _TERMINAL_STATUSES:
+            term.append(sess)
+        else:
+            nonterm.append(sess)
+    # Live first (all of them up to cap), then recent terminal fillers.
+    sessions = nonterm[:MAX_BATCH_SESSIONS]
+    if len(sessions) < MAX_BATCH_SESSIONS:
+        sessions.extend(term[: MAX_BATCH_SESSIONS - len(sessions)])
+    out = {k: v for k, v in b.items() if not str(k).startswith("_")}
+    out.update({**stats, "sessions": sessions})
+    if isinstance(out.get("reg_config"), dict):
+        out["reg_config"] = {
+            k: v for k, v in out["reg_config"].items() if not str(k).startswith("_")
+        }
     # Surface effective status for older UIs that only read `status`.
     if stats.get("batch_status"):
         # Don't clobber an explicit cooperative "stopping" marker while workers live.

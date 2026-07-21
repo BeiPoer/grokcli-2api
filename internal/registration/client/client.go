@@ -7,9 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
 const APIVersion = "v1"
@@ -37,6 +39,10 @@ func (c *Client) Start(ctx context.Context, request map[string]any, idempotencyK
 		headers.Set("Idempotency-Key", idempotencyKey)
 	}
 	return c.do(ctx, http.MethodPost, "/jobs", request, headers)
+}
+
+func (c *Client) TestRemoteImport(ctx context.Context, request map[string]any) (map[string]any, error) {
+	return c.do(ctx, http.MethodPost, "/remote-test", request, nil)
 }
 
 func (c *Client) Sessions(ctx context.Context) (map[string]any, error) {
@@ -73,6 +79,18 @@ func (c *Client) Reclaim(ctx context.Context, autoResume bool) (map[string]any, 
 
 func (c *Client) StopAll(ctx context.Context) (map[string]any, error) {
 	return c.do(ctx, http.MethodPost, "/stop", map[string]any{}, nil)
+}
+
+func (c *Client) StartDeviceLogin(ctx context.Context, request map[string]any) (map[string]any, error) {
+	return c.doAbsolute(ctx, http.MethodPost, "/internal/device/v1/login", request, nil)
+}
+
+func (c *Client) DeviceLoginSession(ctx context.Context, sessionID string) (map[string]any, error) {
+	return c.doAbsolute(ctx, http.MethodGet, "/internal/device/v1/sessions/"+url.PathEscape(sessionID), nil, nil)
+}
+
+func (c *Client) DeviceLoginSessions(ctx context.Context) (map[string]any, error) {
+	return c.doAbsolute(ctx, http.MethodGet, "/internal/device/v1/sessions", nil, nil)
 }
 
 func (c *Client) StartSSOImport(ctx context.Context, request map[string]any) (map[string]any, error) {
@@ -120,7 +138,20 @@ func (c *Client) doAbsolute(ctx context.Context, method, absPath string, body an
 	}
 	httpClient := c.HTTP
 	if httpClient == nil {
-		httpClient = http.DefaultClient
+		// Fail-fast for admin poll paths — DefaultClient has no timeout and can
+		// freeze registration log refresh for tens of seconds under load.
+		// Keep under the browser poll budget (~2s) so Go→sidecar→browser stays snappy.
+		httpClient = &http.Client{
+			// Keep under browser REG_POLL_TIMEOUT_MS (1.2s) so admin log ticks stay live.
+			Timeout: 900 * time.Millisecond,
+			Transport: &http.Transport{
+				DialContext:           (&net.Dialer{Timeout: 400 * time.Millisecond}).DialContext,
+				MaxIdleConns:          64,
+				MaxIdleConnsPerHost:   32,
+				IdleConnTimeout:       30 * time.Second,
+				ResponseHeaderTimeout: 700 * time.Millisecond,
+			},
+		}
 	}
 	response, err := httpClient.Do(request)
 	if err != nil {

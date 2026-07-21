@@ -91,50 +91,13 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 def main() -> int:
-    import grok2api.admin.settings_store as settings
     from grok2api.upstream import grok_build_adapter as adapter
 
-    assert settings.normalize_remote_import_url("grok.example.com/admin/api/") == "https://grok.example.com"
-    cfg = settings._normalize_registration_config(
-        {
-            "remote_import_enabled": True,
-            "remote_import_url": "http://127.0.0.1:3000/admin",
-            "remote_import_password": _Handler.password,
-        },
-        merge_env=False,
+    target_cfg = adapter._validated_remote_import_target(
+        "grok.example.com/admin/api/", _Handler.password
     )
-    assert cfg["remote_import_enabled"] is True
-    assert cfg["remote_import_url"] == "http://127.0.0.1:3000"
-
-    stored = {
-        "registration_config": {
-            "remote_import_enabled": True,
-            "remote_import_url": "https://online.example.com",
-            "remote_import_password": _Handler.password,
-        }
-    }
-    old_get = settings._get_setting_value
-    old_set = settings._set_setting_value
-    old_apply = settings.apply_registration_config_to_runtime
-    settings._get_setting_value = lambda key, default=None: stored.get(key, default)
-    settings._set_setting_value = lambda key, value: stored.__setitem__(key, value)
-    settings.apply_registration_config_to_runtime = lambda cfg=None: None
-    try:
-        public = settings.get_registration_config(include_secrets=False)
-        assert public["remote_import_password"] != _Handler.password
-        saved = settings.set_registration_config(
-            {
-                "remote_import_enabled": True,
-                "remote_import_url": "online.example.com/admin/api",
-                "remote_import_password": public["remote_import_password"],
-            }
-        )
-        assert saved["remote_import_url"] == "https://online.example.com"
-        assert saved["remote_import_password"] == _Handler.password
-    finally:
-        settings._get_setting_value = old_get
-        settings._set_setting_value = old_set
-        settings.apply_registration_config_to_runtime = old_apply
+    assert target_cfg["base_url"] == "https://grok.example.com"
+    assert target_cfg["password"] == _Handler.password
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)

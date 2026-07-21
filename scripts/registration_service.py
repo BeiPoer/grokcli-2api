@@ -22,6 +22,7 @@ import os
 import secrets
 import sys
 from pathlib import Path
+import json
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -83,12 +84,12 @@ def health() -> dict[str, Any]:
         "service": "registration-sso-sidecar",
         "adapter_error": _IMPORT_ERROR,
         "registration": reg is not None,
-        "sso": True,  # SSO handlers import admin helpers lazily
+        "sso": True,  # SSO handlers import sso_import helpers lazily
         "captcha_provider": captcha_provider,
         "local_solver_url": local_solver if captcha_provider == "local" else None,
         "endpoints": {
             "registration": API_PREFIX,
-            "sso": "/internal/sso/v1",
+            "sso": "/internal/sso/v1", "device": "/internal/device/v1",
         },
     }
     if reg is not None:
@@ -101,11 +102,135 @@ def health() -> dict[str, Any]:
     return out
 
 
+
+def _jsonable(value: Any, *, depth: int = 0) -> Any:
+    """Best-effort JSON sanitizer for adapter responses.
+
+    Registration sessions keep process-local objects under `_receiver` etc.
+    If any leak into the response, FastAPI/Pydantic raises 500.
+    """
+    if depth > 8:
+        return None
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for k, v in value.items():
+            if not isinstance(k, str):
+                continue
+            if k.startswith("_"):
+                continue
+            if callable(v):
+                continue
+            out[k] = _jsonable(v, depth=depth + 1)
+        return out
+    if isinstance(value, (list, tuple, set)):
+        return [_jsonable(v, depth=depth + 1) for v in value]
+    # Drop unknown objects (mail receivers, clients, threads, ...).
+    try:
+        json.dumps(value)
+        return value
+    except Exception:
+        return str(value)
+
+
 @app.get(f"{API_PREFIX}/availability")
 def availability(request: Request) -> dict[str, Any]:
     _require_auth(request)
     adapter = _adapter()
     return adapter.registration_available()
+
+
+@app.post(f"{API_PREFIX}/mail/domains")
+async def list_mail_domains(request: Request) -> dict[str, Any]:
+    """List selectable domains for YYDS / GPTMail / CF Temp Email / TempMail.lol / MoeMail."""
+    _require_auth(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    try:
+        from grok2api.upstream import moemail as mail
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"moemail module unavailable: {exc}") from exc
+
+    prov = mail.normalize_mail_provider(
+        body.get("mail_provider") or body.get("provider"),
+        base_url=str(body.get("base_url") or body.get("moemail_base_url") or body.get("cfmail_base_url") or ""),
+    )
+    key = str(
+        body.get("api_key")
+        or body.get("moemail_api_key")
+        or body.get("yyds_api_key")
+        or body.get("gptmail_api_key")
+        or body.get("cfmail_api_key")
+        or body.get("tempmail_api_key")
+        or ""
+    ).strip()
+    base = str(
+        body.get("base_url")
+        or body.get("moemail_base_url")
+        or body.get("cfmail_base_url")
+        or ""
+    ).strip()
+    domains: list[str] = []
+    note = ""
+    base_out = base
+    try:
+        if prov == "yyds":
+            domains = mail.yyds_list_domains(api_key=key or None, base_url=base or None)
+            note = "YYDS GET /v1/domains"
+            base_out = mail.normalize_yyds_base_url(base or None)
+        elif prov == "gptmail":
+            domains = mail.gptmail_list_domains(api_key=key or None, base_url=base or None)
+            note = "GPTMail GET /api/domains/public"
+            base_out = mail.normalize_gptmail_base_url(base or None)
+        elif prov == "cfmail":
+            domains = mail.cfmail_list_domains(api_key=key or None, base_url=base or None)
+            note = "CF Temp Email GET /open_api/settings"
+            base_out = (base or mail.CFMAIL_DEFAULT_BASE_URL).rstrip("/")
+        elif prov == "tempmail":
+            domains = mail.tempmail_list_domains(api_key=key or None, base_url=base or None)
+            note = "TempMail.lol free: random domain (no catalog)"
+            base_out = mail.normalize_tempmail_base_url(base or None)
+        else:
+            # MoeMail has no universal public catalog; return configured domain list.
+            domains = mail.parse_domain_list(str(body.get("domain") or body.get("moemail_domain") or ""))
+            note = "MoeMail: no public catalog; showing configured domains only"
+            base_out = base
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "ok": True,
+        "mail_provider": prov,
+        "base_url": base_out,
+        "domains": domains,
+        "count": len(domains),
+        "note": note,
+    }
+
+
+@app.post(f"{API_PREFIX}/remote-test")
+async def test_remote_import_target(request: Request) -> dict[str, Any]:
+    _require_auth(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    adapter = _adapter()
+    try:
+        return _jsonable(
+            adapter.test_remote_import_target(
+                base_url=body.get("remote_import_url"),
+                password=body.get("remote_import_password"),
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post(f"{API_PREFIX}/jobs")
@@ -124,6 +249,8 @@ async def start_job(
     # Idempotency key is accepted for contract compatibility; adapter currently
     # relies on its own session/batch ids.
     _ = idempotency_key
+    # Accept full body keys then resolve active mail credentials into the
+    # historical moemail_api_key / moemail_base_url fields the adapter reads.
     kwargs = {
         k: body.get(k)
         for k in (
@@ -144,22 +271,134 @@ async def start_job(
             "concurrency",
             "stagger_ms",
             "probe_delay_sec",
+            "yyds_api_key",
+            "gptmail_api_key",
+            "cfmail_api_key",
+            "tempmail_api_key",
+            "yyds_domain",
+            "gptmail_domain",
+            "cfmail_domain",
+            "tempmail_domain",
+            "moemail_domain",
+            "cfmail_base_url",
+            "api_key",
+            "base_url",
+            "remote_import_enabled",
+            "remote_import_url",
+            "remote_import_password",
         )
         if k in body
     }
+    try:
+        from grok2api.upstream.moemail import normalize_mail_provider as _nmp
+
+        prov = _nmp(
+            kwargs.get("mail_provider"),
+            base_url=str(kwargs.get("moemail_base_url") or kwargs.get("base_url") or ""),
+        )
+    except Exception:
+        prov = str(kwargs.get("mail_provider") or "moemail").strip().lower() or "moemail"
+    kwargs["mail_provider"] = prov
+    # Active domain from provider-specific slot.
+    dom = str(kwargs.get("domain") or "").strip()
+    if prov == "yyds":
+        dom = str(kwargs.get("yyds_domain") or dom).strip()
+        key = str(kwargs.get("yyds_api_key") or kwargs.get("api_key") or "").strip()
+        # Prefer dedicated slot; only fall back to moemail_api_key if it looks like YYDS.
+        if not key:
+            mk = str(kwargs.get("moemail_api_key") or "").strip()
+            if mk.startswith("AC-"):
+                key = mk
+        kwargs["moemail_api_key"] = key
+        kwargs["moemail_base_url"] = ""  # fixed host
+        kwargs["domain"] = dom
+        if not key:
+            raise HTTPException(
+                status_code=400,
+                detail="YYDS API Key missing. Save AC-… key in 协议注册配置 (YYDS panel).",
+            )
+    elif prov == "gptmail":
+        dom = str(kwargs.get("gptmail_domain") or dom).strip()
+        key = str(kwargs.get("gptmail_api_key") or kwargs.get("api_key") or "").strip()
+        # Empty key is OK only if a real sk-… is later provided; reject other shapes.
+        if key.startswith("mk_") or key.startswith("AC-"):
+            key = ""
+        kwargs["moemail_api_key"] = key
+        kwargs["moemail_base_url"] = ""
+        kwargs["domain"] = dom
+        if not key:
+            raise HTTPException(
+                status_code=400,
+                detail="GPTMail API Key missing. Save sk-… from https://mail.chatgpt.org.uk/zh/api/",
+            )
+    elif prov == "cfmail":
+        dom = str(kwargs.get("cfmail_domain") or dom).strip()
+        key = str(kwargs.get("cfmail_api_key") or kwargs.get("api_key") or kwargs.get("moemail_api_key") or "").strip()
+        base = str(kwargs.get("cfmail_base_url") or kwargs.get("base_url") or kwargs.get("moemail_base_url") or "").strip()
+        kwargs["moemail_api_key"] = key
+        kwargs["moemail_base_url"] = base
+        kwargs["domain"] = dom
+        if not key:
+            raise HTTPException(
+                status_code=400,
+                detail="CF Temp Email admin password/key missing.",
+            )
+        if not base:
+            raise HTTPException(
+                status_code=400,
+                detail="CF Temp Email Base URL missing.",
+            )
+    elif prov == "tempmail":
+        # Free tier: no API key required. Optional Plus/Ultra Bearer key.
+        dom = str(kwargs.get("tempmail_domain") or dom).strip()
+        key = str(kwargs.get("tempmail_api_key") or kwargs.get("api_key") or "").strip()
+        kwargs["moemail_api_key"] = key
+        kwargs["moemail_base_url"] = ""
+        kwargs["domain"] = dom
+    else:
+        key = str(kwargs.get("moemail_api_key") or kwargs.get("api_key") or "").strip()
+        base = str(kwargs.get("moemail_base_url") or kwargs.get("base_url") or "").strip()
+        dom = str(kwargs.get("moemail_domain") or dom).strip()
+        # Reject cross-provider pollution (YYDS AC-* / GPTMail sk-* in MoeMail slot).
+        if key.startswith("AC-") or key.lower().startswith("sk-"):
+            key = ""
+        kwargs["moemail_api_key"] = key
+        kwargs["moemail_base_url"] = base
+        kwargs["domain"] = dom
+        if not key:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "MoeMail API Key missing or invalid (got YYDS/GPTMail-shaped key). "
+                    "Re-save MoeMail Key (mk_…) in 协议注册配置 — switching providers "
+                    "must not overwrite the MoeMail slot."
+                ),
+            )
+        if not base:
+            raise HTTPException(
+                status_code=400,
+                detail="MoeMail Base URL missing. Re-save MoeMail Base URL in 协议注册配置.",
+            )
+    # Drop non-adapter kwargs
+    for drop in (
+        "yyds_api_key", "gptmail_api_key", "cfmail_api_key", "tempmail_api_key",
+        "yyds_domain", "gptmail_domain", "cfmail_domain", "tempmail_domain", "moemail_domain",
+        "cfmail_base_url", "api_key", "base_url",
+    ):
+        kwargs.pop(drop, None)
     result = adapter.start_registration(**kwargs)
     if not isinstance(result, dict):
         raise HTTPException(status_code=500, detail="invalid registration response")
     if result.get("ok") is False:
         raise HTTPException(status_code=400, detail=str(result.get("error") or "registration failed"))
-    return result
+    return _jsonable(result)
 
 
 @app.get(f"{API_PREFIX}/sessions")
 def list_sessions(request: Request) -> dict[str, Any]:
     _require_auth(request)
     adapter = _adapter()
-    return adapter.list_registration_sessions()
+    return _jsonable(adapter.list_registration_sessions())
 
 
 @app.get(f"{API_PREFIX}/sessions/{{session_id}}")
@@ -174,14 +413,14 @@ def get_session(session_id: str, request: Request) -> dict[str, Any]:
     sess = adapter.get_registration_session(session_id, include_auth_json=include_auth)
     if not sess:
         raise HTTPException(status_code=404, detail="session not found")
-    return sess
+    return _jsonable(sess)
 
 
 @app.post(f"{API_PREFIX}/sessions/{{session_id}}/stop")
 def stop_session(session_id: str, request: Request) -> dict[str, Any]:
     _require_auth(request)
     adapter = _adapter()
-    return adapter.stop_registration_session(session_id)
+    return _jsonable(adapter.stop_registration_session(session_id))
 
 
 @app.get(f"{API_PREFIX}/batches/{{batch_id}}")
@@ -191,7 +430,7 @@ def get_batch(batch_id: str, request: Request) -> dict[str, Any]:
     batch = adapter.get_registration_batch(batch_id)
     if not batch:
         raise HTTPException(status_code=404, detail="batch not found")
-    return batch
+    return _jsonable(batch)
 
 
 @app.post(f"{API_PREFIX}/batches/{{batch_id}}/resume")
@@ -205,14 +444,14 @@ async def resume_batch(batch_id: str, request: Request) -> dict[str, Any]:
             force = bool(body.get("force"))
     except Exception:
         force = False
-    return adapter.resume_registration_batch(batch_id, force=force)
+    return _jsonable(adapter.resume_registration_batch(batch_id, force=force))
 
 
 @app.post(f"{API_PREFIX}/batches/{{batch_id}}/stop")
 def stop_batch(batch_id: str, request: Request) -> dict[str, Any]:
     _require_auth(request)
     adapter = _adapter()
-    return adapter.stop_registration_batch(batch_id)
+    return _jsonable(adapter.stop_registration_batch(batch_id))
 
 
 @app.post(f"{API_PREFIX}/reclaim")
@@ -231,12 +470,12 @@ async def reclaim(request: Request) -> dict[str, Any]:
     if callable(fn):
         # signature may not take auto_resume; call best-effort
         try:
-            return fn(auto_resume=auto_resume)  # type: ignore[misc]
+            return _jsonable(fn(auto_resume=auto_resume))  # type: ignore[misc]
         except TypeError:
-            return fn()
+            return _jsonable(fn())
     fn2 = getattr(adapter, "reclaim_orphaned_registration_sessions", None)
     if callable(fn2):
-        return fn2()
+        return _jsonable(fn2())
     return {"ok": True, "reclaimed": 0}
 
 
@@ -244,7 +483,84 @@ async def reclaim(request: Request) -> dict[str, Any]:
 def stop_all(request: Request) -> dict[str, Any]:
     _require_auth(request)
     adapter = _adapter()
-    return adapter.stop_all_active_registrations()
+    return _jsonable(adapter.stop_all_active_registrations())
+
+
+# ---------------------------------------------------------------------------
+# Device-code login (Python-owned OIDC). Go admin proxies these endpoints.
+# ---------------------------------------------------------------------------
+DEVICE_PREFIX = "/internal/device/v1"
+
+
+@app.post(f"{DEVICE_PREFIX}/login")
+async def device_login_start(request: Request) -> dict[str, Any]:
+    """Start native OIDC device-code login (no Grok CLI required)."""
+    _require_auth(request)
+    mode = "device"
+    capture = True
+    try:
+        body = await request.json()
+        if isinstance(body, dict):
+            mode = str(body.get("mode") or "device")
+            if "capture" in body:
+                capture = bool(body.get("capture"))
+    except Exception:
+        pass
+    try:
+        from grok2api.pool.accounts import start_login
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=503, detail=f"device login unavailable: {exc}") from exc
+    try:
+        result = start_login(mode=mode, capture=capture)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"device login failed: {exc}") from exc
+    if not isinstance(result, dict):
+        raise HTTPException(status_code=500, detail="invalid device login response")
+    if result.get("ok") is False:
+        raise HTTPException(status_code=400, detail=str(result.get("error") or "device login failed"))
+    return _jsonable(result)
+
+
+@app.get(f"{DEVICE_PREFIX}/sessions/{{session_id}}")
+def device_login_session(session_id: str, request: Request) -> dict[str, Any]:
+    _require_auth(request)
+    try:
+        from grok2api.pool.accounts import get_login_session
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=503, detail=f"device login unavailable: {exc}") from exc
+    sess = get_login_session(session_id)
+    if not sess:
+        raise HTTPException(status_code=404, detail="device session not found")
+    # Strip secrets from poll response.
+    out = dict(sess) if isinstance(sess, dict) else {}
+    out.pop("device_code", None)
+    out.pop("password", None)
+    out.pop("access_token", None)
+    out.pop("refresh_token", None)
+    out.pop("key", None)
+    return _jsonable(out)
+
+
+@app.get(f"{DEVICE_PREFIX}/sessions")
+def device_login_sessions(request: Request) -> dict[str, Any]:
+    _require_auth(request)
+    try:
+        from grok2api.pool.accounts import list_login_sessions
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=503, detail=f"device login unavailable: {exc}") from exc
+    items = list_login_sessions() or []
+    cleaned = []
+    for sess in items:
+        if not isinstance(sess, dict):
+            continue
+        row = dict(sess)
+        row.pop("device_code", None)
+        row.pop("password", None)
+        row.pop("access_token", None)
+        row.pop("refresh_token", None)
+        row.pop("key", None)
+        cleaned.append(row)
+    return _jsonable({"ok": True, "sessions": cleaned, "count": len(cleaned)})
 
 
 # ---------------------------------------------------------------------------
@@ -264,9 +580,9 @@ async def sso_import_start(request: Request) -> dict[str, Any]:
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="body must be object")
 
-    # Reuse admin_routes helpers so conversion stays in original language/script path.
+    # Reuse sso_import helpers so conversion stays in original language/script path.
     try:
-        from grok2api.admin import admin_routes as ar
+        from grok2api.admin import sso_import as ar
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=503, detail=f"sso import helpers unavailable: {exc}") from exc
 
@@ -297,9 +613,9 @@ async def sso_import_start(request: Request) -> dict[str, Any]:
         from grok2api.config import SSO_IMPORT_WORKERS
     except Exception:
         SSO_IMPORT_WORKERS = 8
-    workers = min(int(max_workers), int(SSO_IMPORT_WORKERS), max(1, len(sso_items)))
-    if delay and delay >= 5:
-        workers = min(workers, 4)
+    workers = min(int(max_workers), int(SSO_IMPORT_WORKERS), max(1, len(sso_items)), 12)
+    if delay and delay >= 2:
+        workers = min(workers, 2)
 
     job_id = f"sso_{uuid.uuid4().hex[:16]}"
     now = time.time()
@@ -356,7 +672,7 @@ async def sso_import_start(request: Request) -> dict[str, Any]:
 def sso_import_job(job_id: str, request: Request) -> dict[str, Any]:
     _require_auth(request)
     try:
-        from grok2api.admin import admin_routes as ar
+        from grok2api.admin import sso_import as ar
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=503, detail=f"sso import helpers unavailable: {exc}") from exc
     job = ar._sso_job_get(str(job_id or "").strip())

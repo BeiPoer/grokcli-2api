@@ -52,6 +52,13 @@ func TestBuildAccountListWhereStatus(t *testing.T) {
 	if where == "" || !containsFold(where, "cooldown") {
 		t.Fatalf("cooldown where=%q args=%v", where, args)
 	}
+	// Sticky cool: pool_status OR until — never cooldown_count (叠加 depth is tip only).
+	if !containsFold(where, "pool_status") {
+		t.Fatalf("cooldown filter must use sticky pool_status: %q", where)
+	}
+	if containsFold(where, "cooldown_count") {
+		t.Fatalf("cooldown filter must not use cooldown_count: %q", where)
+	}
 	where, args = buildAccountListWhere("foo", "disabled", nil)
 	if len(args) != 3 {
 		t.Fatalf("query args=%v", args)

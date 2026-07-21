@@ -51,3 +51,54 @@ func TestResolveOutboundToolGap(t *testing.T) {
 		t.Fatalf("claude gap=%v", got)
 	}
 }
+
+func TestIsCodexClient(t *testing.T) {
+	if !IsCodexClient("codex-tui/0.144.1") {
+		t.Fatal("codex-tui")
+	}
+	if IsCodexClient("OpenAI/Python 2.24.0") {
+		t.Fatal("generic openai python should not be codex")
+	}
+	if IsCodexClient("Go-http-client/1.1") {
+		t.Fatal("go client")
+	}
+}
+
+func TestLooksLikeCodexRequestByTools(t *testing.T) {
+	tools := []any{
+		map[string]any{
+			"type": "function",
+			"name": "exec_command",
+			"parameters": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{"cmd": map[string]any{"type": "string"}},
+				"required":   []any{"cmd"},
+			},
+		},
+	}
+	if !LooksLikeCodexRequest("", tools, nil) {
+		t.Fatal("exec_command+cmd should look like Codex without UA")
+	}
+	if LooksLikeCodexRequest("", []any{map[string]any{"name": "Read", "parameters": map[string]any{"properties": map[string]any{"file_path": map[string]any{"type": "string"}}}}}, nil) {
+		t.Fatal("Read tool must not look like Codex")
+	}
+	if !LooksLikeCodexRequest("codex-cli/1", nil, nil) {
+		t.Fatal("UA still works")
+	}
+}
+
+func TestEffectiveAutoCharsToolsSchema(t *testing.T) {
+	Reset()
+	t.Cleanup(Reset)
+	Configure(boolPtr(false), intPtr(0))
+	tools := []any{map[string]any{
+		"name":       "exec_command",
+		"parameters": map[string]any{"properties": map[string]any{"cmd": map[string]any{"type": "string"}}},
+	}}
+	if got := EffectiveAutoCharsFor("", tools, nil); got != CodexDefaultAutoChars {
+		t.Fatalf("got %d", got)
+	}
+	if got := EffectiveAutoCharsFor("curl/8", nil, nil); got != 0 {
+		t.Fatalf("curl should be 0, got %d", got)
+	}
+}
