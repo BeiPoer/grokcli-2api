@@ -46,8 +46,7 @@ services:
       # Only the app API is published. Postgres/Redis stay internal-only
       # (compose network). Inline Turnstile Solver listens on container
       # loopback 127.0.0.1:5072 and is NOT published to the host.
-      - "3245:3000"
-      - "40081:40081"
+      - "3245:40081"
     shm_size: "1gb"
     security_opt:
       - seccomp:unconfined
