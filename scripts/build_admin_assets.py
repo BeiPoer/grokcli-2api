@@ -39,6 +39,7 @@ def main() -> None:
     )
 
     for path in sorted(ADMIN.glob("*.html")):
+        # Force UTF-8: Windows default locale (e.g. gbk) breaks Chinese admin HTML.
         html = path.read_text(encoding="utf-8")
         html = re.sub(
             r'href="/static/css/admin-antd\.css[^"]*"',

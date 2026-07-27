@@ -1234,8 +1234,6 @@ function rebindPageControls() {
     finally { if ($("btn-start-reg")) $("btn-start-reg").disabled = false; }
   });
   if ($("btn-save-reg")) on("btn-save-reg", "onclick", () => { saveRegConfig().catch(() => {}); });
-  if ($("btn-save-remote-reg")) on("btn-save-remote-reg", "onclick", () => { saveRegConfig().catch(() => {}); });
-  if ($("btn-test-remote-reg")) on("btn-test-remote-reg", "onclick", () => { testRemoteRegTarget().catch(() => {}); });
   // Soft-nav swaps registration form DOM — rebind provider select + repaint panels.
   try { bindRegMailFormControls(); } catch (e) { console.warn("bindRegMailFormControls", e); }
   if ($("btn-refresh-reg")) on("btn-refresh-reg", "onclick", () => {
@@ -6157,15 +6155,6 @@ function readRegConfig() {
     probe_delay_sec: $("reg-probe-delay-sec")
       ? $("reg-probe-delay-sec").value.trim()
       : "30",
-    remote_import_enabled: !!(
-      $("reg-remote-import-enabled") && $("reg-remote-import-enabled").checked
-    ),
-    remote_import_url: $("reg-remote-import-url")
-      ? $("reg-remote-import-url").value.trim()
-      : "",
-    remote_import_password: $("reg-remote-import-password")
-      ? $("reg-remote-import-password").value
-      : "",
   };
 }
 // MoeMail official EXPIRY_OPTIONS only:
@@ -6340,15 +6329,6 @@ function applyRegConfig(cfg) {
       Number.isFinite(pd) ? Math.max(0, Math.min(600, Math.floor(pd))) : 30
     );
   }
-  if ($("reg-remote-import-enabled")) {
-    $("reg-remote-import-enabled").checked = !!cfg.remote_import_enabled;
-  }
-  if ($("reg-remote-import-url")) {
-    $("reg-remote-import-url").value = cfg.remote_import_url || "";
-  }
-  if ($("reg-remote-import-password")) {
-    $("reg-remote-import-password").value = cfg.remote_import_password || "";
-  }
   syncRegCaptchaProviderUI();
   syncRegMailProviderUI();
   regConfigCache = Object.assign({}, cfg);
@@ -6356,9 +6336,7 @@ function applyRegConfig(cfg) {
 
 function cacheRegConfigLocal(cfg) {
   try {
-    const safe = Object.assign({}, cfg || readRegConfig());
-    if (safe.remote_import_password) safe.remote_import_password = "****";
-    localStorage.setItem(REG_CONFIG_KEY, JSON.stringify(safe));
+    localStorage.setItem(REG_CONFIG_KEY, JSON.stringify(cfg || readRegConfig()));
   } catch (_) {}
 }
 
@@ -6463,8 +6441,7 @@ async function saveRegConfig() {
     for (const k of ["count", "concurrency", "stagger_ms", "probe_delay_sec", "proxy",
       "proxy_username", "proxy_strategy", "captcha_provider", "expiry_ms",
       "moemail_domain", "yyds_domain", "gptmail_domain", "cfmail_domain", "tempmail_domain",
-      "moemail_base_url", "cfmail_base_url", "domain", "base_url", "mail_provider",
-      "remote_import_enabled", "remote_import_url"]) {
+      "moemail_base_url", "cfmail_base_url", "domain", "base_url", "mail_provider"]) {
       if (Object.prototype.hasOwnProperty.call(cfg, k) && cfg[k] != null && cfg[k] !== "") {
         // Keep user-submitted value authoritative after save.
         if (saved[k] == null || saved[k] === "" || String(saved[k]) !== String(cfg[k])) {
@@ -6480,8 +6457,7 @@ async function saveRegConfig() {
       if (cfg[k] != null && cfg[k] !== "") saved[k] = cfg[k];
     }
     for (const k of ["moemail_domain", "yyds_domain", "gptmail_domain", "cfmail_domain", "tempmail_domain",
-      "moemail_base_url", "cfmail_base_url", "domain", "base_url", "proxy", "proxy_username", "proxy_strategy",
-      "remote_import_enabled", "remote_import_url"]) {
+      "moemail_base_url", "cfmail_base_url", "domain", "base_url", "proxy", "proxy_username", "proxy_strategy"]) {
       if (Object.prototype.hasOwnProperty.call(cfg, k)) saved[k] = cfg[k];
     }
     applyRegConfig(saved);
@@ -6498,28 +6474,6 @@ async function saveRegConfig() {
     throw e;
   } finally {
     if (saveEpoch === regConfigSaveEpoch) regConfigSaving = false;
-  }
-}
-
-async function testRemoteRegTarget() {
-  const btn = $("btn-test-remote-reg");
-  const cfg = readRegConfig();
-  try {
-    if (btn) btn.disabled = true;
-    const r = await api("/accounts/register-email/remote-test", {
-      method: "POST",
-      body: JSON.stringify({
-        remote_import_url: cfg.remote_import_url,
-        remote_import_password: cfg.remote_import_password,
-      }),
-    });
-    toast(r.message || "线上项目连接成功");
-    return r;
-  } catch (e) {
-    toast((e && e.message) || "线上项目连接失败", false);
-    throw e;
-  } finally {
-    if (btn) btn.disabled = false;
   }
 }
 
@@ -6696,9 +6650,6 @@ function buildRegBody(config) {
   if (Number.isFinite(probeDelay) && probeDelay >= 0) {
     body.probe_delay_sec = Math.min(600, Math.max(0, Math.floor(probeDelay)));
   }
-  body.remote_import_enabled = !!config.remote_import_enabled;
-  body.remote_import_url = config.remote_import_url == null ? "" : String(config.remote_import_url);
-  body.remote_import_password = config.remote_import_password == null ? "" : String(config.remote_import_password);
   return body;
 }
 
@@ -7670,15 +7621,12 @@ async function pollRegSession() {
 
     // Fallback client-side probe for imported accounts missing backend probe.
     // Skip while stopping — no need to thrash the card with new probe lines mid-stop.
-    const fallbackSessions = sessions.filter(
-      (s) => String((s && s.import_target && s.import_target.mode) || "local").toLowerCase() !== "remote"
-    );
-    const importedIds = collectImportedAccountIds(fallbackSessions);
+    const importedIds = collectImportedAccountIds(sessions);
     const needProbe = importedIds.filter((id) => !regProbedIds.has(id));
-    const backendProbed = fallbackSessions.some(
+    const backendProbed = sessions.some(
       (s) => s && s.probe && (s.probe.count > 0 || (Array.isArray(s.probe.results) && s.probe.results.length))
     );
-    if (finished && !regStopping && needProbe.length && !backendProbed && !regProbeRunning) {
+    if (!regStopping && needProbe.length && !backendProbed && !regProbeRunning) {
       // Fire and continue polling; probe results append to log.
       // New registrations: wait probe_delay_sec before first health probe.
       probeImportedAccounts(needProbe, {
@@ -10431,12 +10379,6 @@ if ($("btn-test-reg-proxy") && !$("btn-test-reg-proxy").onclick) {
 if ($("btn-save-reg") && !$("btn-save-reg").onclick) {
   on("btn-save-reg", "onclick", () => { saveRegConfig().catch(() => {}); });
 }
-if ($("btn-save-remote-reg") && !$("btn-save-remote-reg").onclick) {
-  on("btn-save-remote-reg", "onclick", () => { saveRegConfig().catch(() => {}); });
-}
-if ($("btn-test-remote-reg") && !$("btn-test-remote-reg").onclick) {
-  on("btn-test-remote-reg", "onclick", () => { testRemoteRegTarget().catch(() => {}); });
-}
 if ($("btn-refresh-reg") && !$("btn-refresh-reg").onclick) {
   on("btn-refresh-reg", "onclick", () => {
     refreshRegistrationProgress({ toastIfEmpty: true }).catch(() => {});
@@ -10491,7 +10433,7 @@ try { updateRegProxyHint(); } catch (_) {}
   [["btn-probe-all","btn-probe-all-2"],["btn-refresh-quota","btn-refresh-quota-2"]].forEach(([main,alt]) => {
     if (!$(main) && $(alt)) { try { $(alt).id = main; } catch(_){ } }
   });
-
+  
 /* ── Usage / token stats ───────────────────────────── */
 let usageDays = 7;
 let usageLoading = false;

@@ -155,6 +155,7 @@ func newProbeHTTPClient() *http.Client {
 	return &http.Client{
 		Timeout: defaultProbeTimeout,
 		Transport: &http.Transport{
+			Proxy:                 http.ProxyFromEnvironment,
 			MaxIdleConns:          128,
 			MaxIdleConnsPerHost:   64,
 			MaxConnsPerHost:       96,

@@ -399,10 +399,6 @@ async function softNavigate(name, opts) {
   const target = href.replace(/\/$/, "") || "/admin";
   if (cur === target && !opts.force) {
     applyPageMeta(page);
-    try {
-      if (opts.hash) setPageSection(opts.hash, { replace: !!opts.replace });
-      else initPageSubnav({ replace: true });
-    } catch (_) {}
     return true;
   }
   // Keep shell painted. NEVER full-document navigate for admin pages (that causes black flash).
@@ -464,10 +460,8 @@ async function softNavigate(name, opts) {
     if (ns && $("page-sub")) $("page-sub").textContent = ns.textContent;
     try { buildMobileNav(); } catch (_) {}
     applyPageMeta(page);
-    const hashFromOpts = opts.hash ? ("#" + normalizeSectionHash(opts.hash).replace(/^#/, "")) : "";
-    const nextUrl = href + (hashFromOpts || "");
-    if (!opts.replace) history.pushState({ g2aPage: page }, "", nextUrl);
-    else history.replaceState({ g2aPage: page }, "", nextUrl);
+    if (!opts.replace) history.pushState({ g2aPage: page }, "", href);
+    else history.replaceState({ g2aPage: page }, "", href);
 
     try {
       if (typeof rebindPageControls === "function") rebindPageControls();
@@ -744,86 +738,7 @@ function bindAccountsPagerControls() {
   }
 }
 
-
-/* ── Page sub-navigation (settings / accounts) ───────── */
-function normalizeSectionHash(raw) {
-  return String(raw || "").replace(/^#/, "").trim().toLowerCase();
-}
-
-function pageSubnavRoot() {
-  return document.querySelector(".g2a-sublayout[data-page-subnav]");
-}
-
-function listPageSections(root) {
-  root = root || pageSubnavRoot();
-  if (!root) return [];
-  return Array.from(root.querySelectorAll(".g2a-subpanel[data-section]"))
-    .map((el) => el.getAttribute("data-section") || "")
-    .filter(Boolean);
-}
-
-function resolvePageSection(section, root) {
-  root = root || pageSubnavRoot();
-  if (!root) return "";
-  const sections = listPageSections(root);
-  if (!sections.length) return "";
-  const fallback = root.getAttribute("data-default-section") || sections[0];
-  const key = normalizeSectionHash(section);
-  if (key && sections.includes(key)) return key;
-  return fallback;
-}
-
-function setPageSection(section, opts) {
-  opts = opts || {};
-  const root = pageSubnavRoot();
-  if (!root) return "";
-  const key = resolvePageSection(section, root);
-  if (!key) return "";
-
-  root.querySelectorAll(".g2a-subpanel[data-section]").forEach((panel) => {
-    const on = (panel.getAttribute("data-section") || "") === key;
-    panel.classList.toggle("is-active", on);
-    if (on) panel.removeAttribute("hidden");
-    else panel.setAttribute("hidden", "");
-  });
-  root.querySelectorAll(".g2a-subnav-item[data-section]").forEach((btn) => {
-    const on = (btn.getAttribute("data-section") || "") === key;
-    btn.classList.toggle("is-active", on);
-    if (on) btn.setAttribute("aria-current", "page");
-    else btn.removeAttribute("aria-current");
-  });
-
-  if (!opts.skipHistory) {
-    const url = location.pathname + location.search + "#" + key;
-    try {
-      if (opts.replace) history.replaceState(history.state || { g2aPage: document.body.dataset.page }, "", url);
-      else if (normalizeSectionHash(location.hash) !== key) history.pushState(history.state || { g2aPage: document.body.dataset.page }, "", url);
-      else history.replaceState(history.state || { g2aPage: document.body.dataset.page }, "", url);
-    } catch (_) {}
-  }
-  root.dataset.activeSection = key;
-  return key;
-}
-
-function initPageSubnav(opts) {
-  opts = opts || {};
-  const root = pageSubnavRoot();
-  if (!root) return "";
-  if (!root.dataset.subnavBound) {
-    root.dataset.subnavBound = "1";
-    root.addEventListener("click", (e) => {
-      const btn = e.target && e.target.closest ? e.target.closest(".g2a-subnav-item[data-section]") : null;
-      if (!btn || !root.contains(btn)) return;
-      e.preventDefault();
-      setPageSection(btn.getAttribute("data-section") || "", { replace: false });
-    });
-  }
-  const fromHash = normalizeSectionHash(location.hash);
-  return setPageSection(fromHash, { replace: true, skipHistory: !fromHash });
-}
-
 function rebindPageControls() {
-  try { initPageSubnav({ replace: true }); } catch (_) {}
   try { bindKeysControls(); } catch (_) {}
   try { bindVersionSettingsUI(); } catch (_) {}
   try { bindModelsControls(); } catch (_) {}
@@ -1234,8 +1149,6 @@ function rebindPageControls() {
     finally { if ($("btn-start-reg")) $("btn-start-reg").disabled = false; }
   });
   if ($("btn-save-reg")) on("btn-save-reg", "onclick", () => { saveRegConfig().catch(() => {}); });
-  if ($("btn-save-remote-reg")) on("btn-save-remote-reg", "onclick", () => { saveRegConfig().catch(() => {}); });
-  if ($("btn-test-remote-reg")) on("btn-test-remote-reg", "onclick", () => { testRemoteRegTarget().catch(() => {}); });
   // Soft-nav swaps registration form DOM — rebind provider select + repaint panels.
   try { bindRegMailFormControls(); } catch (e) { console.warn("bindRegMailFormControls", e); }
   if ($("btn-refresh-reg")) on("btn-refresh-reg", "onclick", () => {
@@ -5812,27 +5725,6 @@ function syncRegCaptchaProviderUI() {
   if ($("reg-yescaptcha-wrap")) {
     $("reg-yescaptcha-wrap").style.display = isLocal ? "none" : "";
   }
-  syncRegConcurrencyWarning();
-}
-
-function syncRegConcurrencyWarning() {
-  const input = $("reg-concurrency");
-  const warning = $("reg-concurrency-warning");
-  if (!input || !warning) return;
-  const concurrency = Number.parseInt(input.value || "", 10);
-  const provider = $("reg-captcha-provider")
-    ? ($("reg-captcha-provider").value || "local").trim().toLowerCase()
-    : "local";
-  const threshold = provider === "yescaptcha" ? 4 : 2;
-  if (!Number.isFinite(concurrency) || concurrency <= threshold) {
-    warning.hidden = true;
-    warning.textContent = "";
-    return;
-  }
-  warning.textContent = provider === "yescaptcha"
-    ? `警告：并发 ${concurrency} 较高，可能触发远程过盾或 xAI 限流；系统不会自动降低。`
-    : `警告：本地并发 ${concurrency} 较高，Camoufox 每个浏览器约占 200–400MB，可能导致内存不足；系统不会自动降低。`;
-  warning.hidden = false;
 }
 
 // Per-provider mail fields: each provider has dedicated DOM inputs + DB slots.
@@ -6094,10 +5986,6 @@ if (!window.__g2aRegMailDelegated) {
       }
       if (t.id === "reg-captcha-provider") {
         try { syncRegCaptchaProviderUI(); } catch (_) {}
-        return;
-      }
-      if (t.id === "reg-concurrency") {
-        try { syncRegConcurrencyWarning(); } catch (_) {}
       }
     },
     true
@@ -6157,15 +6045,6 @@ function readRegConfig() {
     probe_delay_sec: $("reg-probe-delay-sec")
       ? $("reg-probe-delay-sec").value.trim()
       : "30",
-    remote_import_enabled: !!(
-      $("reg-remote-import-enabled") && $("reg-remote-import-enabled").checked
-    ),
-    remote_import_url: $("reg-remote-import-url")
-      ? $("reg-remote-import-url").value.trim()
-      : "",
-    remote_import_password: $("reg-remote-import-password")
-      ? $("reg-remote-import-password").value
-      : "",
   };
 }
 // MoeMail official EXPIRY_OPTIONS only:
@@ -6340,15 +6219,6 @@ function applyRegConfig(cfg) {
       Number.isFinite(pd) ? Math.max(0, Math.min(600, Math.floor(pd))) : 30
     );
   }
-  if ($("reg-remote-import-enabled")) {
-    $("reg-remote-import-enabled").checked = !!cfg.remote_import_enabled;
-  }
-  if ($("reg-remote-import-url")) {
-    $("reg-remote-import-url").value = cfg.remote_import_url || "";
-  }
-  if ($("reg-remote-import-password")) {
-    $("reg-remote-import-password").value = cfg.remote_import_password || "";
-  }
   syncRegCaptchaProviderUI();
   syncRegMailProviderUI();
   regConfigCache = Object.assign({}, cfg);
@@ -6356,9 +6226,7 @@ function applyRegConfig(cfg) {
 
 function cacheRegConfigLocal(cfg) {
   try {
-    const safe = Object.assign({}, cfg || readRegConfig());
-    if (safe.remote_import_password) safe.remote_import_password = "****";
-    localStorage.setItem(REG_CONFIG_KEY, JSON.stringify(safe));
+    localStorage.setItem(REG_CONFIG_KEY, JSON.stringify(cfg || readRegConfig()));
   } catch (_) {}
 }
 
@@ -6463,8 +6331,7 @@ async function saveRegConfig() {
     for (const k of ["count", "concurrency", "stagger_ms", "probe_delay_sec", "proxy",
       "proxy_username", "proxy_strategy", "captcha_provider", "expiry_ms",
       "moemail_domain", "yyds_domain", "gptmail_domain", "cfmail_domain", "tempmail_domain",
-      "moemail_base_url", "cfmail_base_url", "domain", "base_url", "mail_provider",
-      "remote_import_enabled", "remote_import_url"]) {
+      "moemail_base_url", "cfmail_base_url", "domain", "base_url", "mail_provider"]) {
       if (Object.prototype.hasOwnProperty.call(cfg, k) && cfg[k] != null && cfg[k] !== "") {
         // Keep user-submitted value authoritative after save.
         if (saved[k] == null || saved[k] === "" || String(saved[k]) !== String(cfg[k])) {
@@ -6480,8 +6347,7 @@ async function saveRegConfig() {
       if (cfg[k] != null && cfg[k] !== "") saved[k] = cfg[k];
     }
     for (const k of ["moemail_domain", "yyds_domain", "gptmail_domain", "cfmail_domain", "tempmail_domain",
-      "moemail_base_url", "cfmail_base_url", "domain", "base_url", "proxy", "proxy_username", "proxy_strategy",
-      "remote_import_enabled", "remote_import_url"]) {
+      "moemail_base_url", "cfmail_base_url", "domain", "base_url", "proxy", "proxy_username", "proxy_strategy"]) {
       if (Object.prototype.hasOwnProperty.call(cfg, k)) saved[k] = cfg[k];
     }
     applyRegConfig(saved);
@@ -6498,28 +6364,6 @@ async function saveRegConfig() {
     throw e;
   } finally {
     if (saveEpoch === regConfigSaveEpoch) regConfigSaving = false;
-  }
-}
-
-async function testRemoteRegTarget() {
-  const btn = $("btn-test-remote-reg");
-  const cfg = readRegConfig();
-  try {
-    if (btn) btn.disabled = true;
-    const r = await api("/accounts/register-email/remote-test", {
-      method: "POST",
-      body: JSON.stringify({
-        remote_import_url: cfg.remote_import_url,
-        remote_import_password: cfg.remote_import_password,
-      }),
-    });
-    toast(r.message || "线上项目连接成功");
-    return r;
-  } catch (e) {
-    toast((e && e.message) || "线上项目连接失败", false);
-    throw e;
-  } finally {
-    if (btn) btn.disabled = false;
   }
 }
 
@@ -6690,15 +6534,12 @@ function buildRegBody(config) {
   const stagger = Number.parseInt(config.stagger_ms || "300", 10);
   const probeDelay = Number.parseInt(config.probe_delay_sec || "30", 10);
   if (Number.isFinite(count) && count > 0) body.count = Math.floor(count);
-  // threads / concurrency: pass the user's positive integer through unchanged.
-  if (Number.isFinite(concurrency) && concurrency > 0) body.concurrency = Math.max(1, Math.floor(concurrency));
+  // threads / concurrency: real in-flight registration cap (3 => 3 at a time)
+  if (Number.isFinite(concurrency) && concurrency > 0) body.concurrency = Math.min(4, Math.max(1, Math.floor(concurrency)));
   if (Number.isFinite(stagger) && stagger >= 0) body.stagger_ms = Math.min(10000, Math.floor(stagger));
   if (Number.isFinite(probeDelay) && probeDelay >= 0) {
     body.probe_delay_sec = Math.min(600, Math.max(0, Math.floor(probeDelay)));
   }
-  body.remote_import_enabled = !!config.remote_import_enabled;
-  body.remote_import_url = config.remote_import_url == null ? "" : String(config.remote_import_url);
-  body.remote_import_password = config.remote_import_password == null ? "" : String(config.remote_import_password);
   return body;
 }
 
@@ -7227,19 +7068,6 @@ function buildRegLogText(sessions, { batch = null, extraLines = [] } = {}) {
       (running ? ` · 进行中 ${running}` : "")
   );
   if (batch && batch.message) lines.push(`batch: ${batch.message}`);
-  // Adapter stores free-text failure reasons under error_detail / spawn_errors
-  // (batch.error is the integer fail counter and is not a message).
-  const errDetail = batch && (batch.error_detail || (
-    typeof batch.error === "string" && batch.error && !/^\d+$/.test(String(batch.error).trim())
-      ? batch.error
-      : ""
-  ));
-  if (errDetail) lines.push(`error_detail: ${String(errDetail).slice(0, 500)}`);
-  const spawnErrs = batch && Array.isArray(batch.spawn_errors) ? batch.spawn_errors : [];
-  if (spawnErrs.length) {
-    lines.push("-------- 失败原因 --------");
-    spawnErrs.slice(0, 20).forEach((e) => lines.push(`  · ${String(e).slice(0, 240)}`));
-  }
   lines.push("-------- 会话明细 --------");
   (sessions || []).forEach((s, i) => lines.push(formatRegSessionLine(s, i)));
   // Real-time step timeline (written by adapter update() → log_lines / Redis).
@@ -7670,15 +7498,12 @@ async function pollRegSession() {
 
     // Fallback client-side probe for imported accounts missing backend probe.
     // Skip while stopping — no need to thrash the card with new probe lines mid-stop.
-    const fallbackSessions = sessions.filter(
-      (s) => String((s && s.import_target && s.import_target.mode) || "local").toLowerCase() !== "remote"
-    );
-    const importedIds = collectImportedAccountIds(fallbackSessions);
+    const importedIds = collectImportedAccountIds(sessions);
     const needProbe = importedIds.filter((id) => !regProbedIds.has(id));
-    const backendProbed = fallbackSessions.some(
+    const backendProbed = sessions.some(
       (s) => s && s.probe && (s.probe.count > 0 || (Array.isArray(s.probe.results) && s.probe.results.length))
     );
-    if (finished && !regStopping && needProbe.length && !backendProbed && !regProbeRunning) {
+    if (!regStopping && needProbe.length && !backendProbed && !regProbeRunning) {
       // Fire and continue polling; probe results append to log.
       // New registrations: wait probe_delay_sec before first health probe.
       probeImportedAccounts(needProbe, {
@@ -7820,26 +7645,13 @@ function bindSoftNav() {
     const page = pageFromPath(pathOnly);
     if (!(page in PAGE_HREF) && page !== "overview") return;
     e.preventDefault();
-    let hash = "";
-    try {
-      const u2 = new URL(href, location.origin);
-      hash = normalizeSectionHash(u2.hash);
-    } catch (_) {}
-    softNavigate(page, { hash });
+    softNavigate(page);
   }, true);
 
   window.addEventListener("popstate", () => {
     const page = pageFromPath(location.pathname);
     if (page === "login") return;
-    const hash = normalizeSectionHash(location.hash);
-    softNavigate(page, { replace: true, force: true, hash });
-  });
-  window.addEventListener("hashchange", () => {
-    try {
-      const root = pageSubnavRoot();
-      if (!root) return;
-      setPageSection(normalizeSectionHash(location.hash), { replace: true, skipHistory: true });
-    } catch (_) {}
+    softNavigate(page, { replace: true, force: true });
   });
 }
 bindSoftNav();
@@ -9682,7 +9494,6 @@ function fillSystemSettingsForm(s) {
   if ($("set-history-tool-max") && s.history_max_tool_result_chars != null) {
     $("set-history-tool-max").value = s.history_max_tool_result_chars;
   }
-  if ($("set-debug-shell-args")) $("set-debug-shell-args").checked = !!s.debug_shell_args;
   // Pool / kick policy — fill with effective values (server defaults when DB
   // has none). Cooldown itself is a sticky status (no duration knobs).
   const polDefaults = {
@@ -9839,7 +9650,6 @@ function collectSystemSettingsPatch(groups) {
     if ($("set-history-tool-max") && $("set-history-tool-max").value !== "") {
       patch.history_max_tool_result_chars = Number($("set-history-tool-max").value);
     }
-    if ($("set-debug-shell-args")) patch.debug_shell_args = !!$("set-debug-shell-args").checked;
   }
   if (want("cooldown")) {
     if ($("set-soft-ttl") && $("set-soft-ttl").value !== "") patch.soft_model_block_ttl_sec = Number($("set-soft-ttl").value);
@@ -10058,7 +9868,6 @@ function settingsGroupDefaults(group) {
         history_compact_auto_chars: 0,
         history_keep_tool_rounds: 32,
         history_max_tool_result_chars: 48000,
-        debug_shell_args: false,
       };
     case "cooldown":
       return {
@@ -10133,7 +9942,6 @@ function applySettingsGroupDefaults(group) {
     if ($("set-history-auto-chars")) $("set-history-auto-chars").value = d.history_compact_auto_chars;
     if ($("set-history-keep-rounds")) $("set-history-keep-rounds").value = d.history_keep_tool_rounds;
     if ($("set-history-tool-max")) $("set-history-tool-max").value = d.history_max_tool_result_chars;
-    if ($("set-debug-shell-args")) $("set-debug-shell-args").checked = !!d.debug_shell_args;
   } else if (group === "cooldown") {
     if ($("set-soft-ttl")) $("set-soft-ttl").value = d.soft_model_block_ttl_sec;
     if ($("set-durable-ttl")) $("set-durable-ttl").value = d.durable_model_block_ttl_sec;
@@ -10431,12 +10239,6 @@ if ($("btn-test-reg-proxy") && !$("btn-test-reg-proxy").onclick) {
 if ($("btn-save-reg") && !$("btn-save-reg").onclick) {
   on("btn-save-reg", "onclick", () => { saveRegConfig().catch(() => {}); });
 }
-if ($("btn-save-remote-reg") && !$("btn-save-remote-reg").onclick) {
-  on("btn-save-remote-reg", "onclick", () => { saveRegConfig().catch(() => {}); });
-}
-if ($("btn-test-remote-reg") && !$("btn-test-remote-reg").onclick) {
-  on("btn-test-remote-reg", "onclick", () => { testRemoteRegTarget().catch(() => {}); });
-}
 if ($("btn-refresh-reg") && !$("btn-refresh-reg").onclick) {
   on("btn-refresh-reg", "onclick", () => {
     refreshRegistrationProgress({ toastIfEmpty: true }).catch(() => {});
@@ -10491,7 +10293,7 @@ try { updateRegProxyHint(); } catch (_) {}
   [["btn-probe-all","btn-probe-all-2"],["btn-refresh-quota","btn-refresh-quota-2"]].forEach(([main,alt]) => {
     if (!$(main) && $(alt)) { try { $(alt).id = main; } catch(_){ } }
   });
-
+  
 /* ── Usage / token stats ───────────────────────────── */
 let usageDays = 7;
 let usageLoading = false;

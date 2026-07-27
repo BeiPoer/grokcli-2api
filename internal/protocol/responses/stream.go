@@ -17,12 +17,13 @@ type ToolDelta struct {
 }
 
 type liveTool struct {
-	id        string
-	name      string
-	arguments string
-	itemID    string
-	output    int
-	emitted   bool
+	id          string
+	name        string
+	arguments   string
+	clientInput string
+	itemID      string
+	output      int
+	emitted     bool
 	// clientAcked is true only after the full function_call group was written.
 	// Soft write failures leave emitted=true but unacked so RequeueUnackedTools
 	// can re-emit a complete added+delta+done cluster ("Tool use interrupted").
@@ -33,24 +34,25 @@ type liveTool struct {
 // numbers. Complete deliberately remains open when no client payload exists so
 // callers can still emit response.failed for an empty upstream HTTP 200.
 type LiveStreamer struct {
-	responseID    string
-	model         string
-	allowed       []string
-	maxTools      int
-	toolsStarted  int
-	sequence      Sequence
-	started       bool
-	closed        bool
-	textOpen      bool
-	reasoningOpen bool
-	messageID     string
-	reasoningID   string
-	text          string
-	reasoning     string
-	output        int
-	textOut       int // output_index of the open text message item (-1 if none)
-	tools         map[int]*liveTool
-	shellArgKeys  map[string]string
+	responseID      string
+	model           string
+	allowed         []string
+	maxTools        int
+	toolsStarted    int
+	sequence        Sequence
+	started         bool
+	closed          bool
+	textOpen        bool
+	reasoningOpen   bool
+	messageID       string
+	reasoningID     string
+	text            string
+	reasoning       string
+	output          int
+	textOut         int // output_index of the open text message item (-1 if none)
+	tools           map[int]*liveTool
+	shellArgKeys    map[string]string
+	customToolNames map[string]bool
 	// pendingClientAcks: tool indexes framed but not yet Ack'd as written.
 	pendingClientAcks []int
 	// pendingTerminal: Complete frames produced but not yet AckTerminal'd.
@@ -61,6 +63,10 @@ type LiveStreamer struct {
 	// Distinct from text/reasoning non-empty (produced) — soft-fail before Ack
 	// must not count as client-visible for TTFT / soft-close decisions.
 	contentDelivered bool
+	// deliveredRunes: client-visible output runes successfully written (text,
+	// reasoning, tool name/args). Used for usage estimation when upstream omits
+	// the final usage frame — more accurate than open-block flags alone.
+	deliveredRunes int
 }
 
 func NewLiveStreamer(responseID, model string, allowed []string) *LiveStreamer {
@@ -71,15 +77,16 @@ func NewLiveStreamer(responseID, model string, allowed []string) *LiveStreamer {
 // maxTools <= 0 means unlimited (Codex / OpenAI-native).
 func NewLiveStreamerWithMaxTools(responseID, model string, allowed []string, maxTools int) *LiveStreamer {
 	return &LiveStreamer{
-		responseID:   responseID,
-		model:        model,
-		allowed:      append([]string(nil), allowed...),
-		maxTools:     maxTools,
-		messageID:    "msg_" + responseID,
-		reasoningID:  "rs_" + responseID,
-		textOut:      -1,
-		tools:        make(map[int]*liveTool),
-		shellArgKeys: map[string]string{},
+		responseID:      responseID,
+		model:           model,
+		allowed:         append([]string(nil), allowed...),
+		maxTools:        maxTools,
+		messageID:       "msg_" + responseID,
+		reasoningID:     "rs_" + responseID,
+		textOut:         -1,
+		tools:           make(map[int]*liveTool),
+		shellArgKeys:    map[string]string{},
+		customToolNames: map[string]bool{},
 	}
 }
 
@@ -93,6 +100,25 @@ func (s *LiveStreamer) SetShellArgKeys(keys map[string]string) {
 		return
 	}
 	s.shellArgKeys = keys
+}
+
+// SetCustomToolNames configures Responses API free-form tools. Internally the
+// upstream sees ordinary function tools with an {input:string} schema; this map
+// restores custom_tool_call/input on the client-facing boundary.
+func (s *LiveStreamer) SetCustomToolNames(names map[string]bool) {
+	if s == nil {
+		return
+	}
+	s.customToolNames = map[string]bool{}
+	for name, custom := range names {
+		if custom {
+			s.customToolNames[name] = true
+		}
+	}
+}
+
+func (s *LiveStreamer) isCustomTool(name string) bool {
+	return s != nil && isCustomToolName(name, s.customToolNames)
 }
 
 func (s *LiveStreamer) projectArgs(toolName, args string) string {
@@ -360,8 +386,48 @@ func (s *LiveStreamer) emitReadyTools(force bool) []string {
 		state.clientAcked = false
 		s.toolsStarted++
 		state.output = s.output
-		state.itemID = fmt.Sprintf("fc_%s_%d", s.responseID, index)
+		custom := s.isCustomTool(state.name)
+		if custom {
+			state.itemID = fmt.Sprintf("ctc_%s_%d", s.responseID, index)
+		} else {
+			state.itemID = fmt.Sprintf("fc_%s_%d", s.responseID, index)
+		}
 		s.pendingClientAcks = append(s.pendingClientAcks, index)
+		if custom {
+			state.clientInput = customToolInput(state.arguments)
+			if state.clientInput == "" {
+				state.emitted = false
+				s.toolsStarted--
+				s.pendingClientAcks = s.pendingClientAcks[:len(s.pendingClientAcks)-1]
+				continue
+			}
+			frames = append(frames,
+				s.sequence.Event("response.output_item.added", map[string]any{
+					"output_index": state.output,
+					"item": map[string]any{
+						"id": state.itemID, "type": "custom_tool_call", "status": "in_progress",
+						"call_id": state.id, "name": state.name, "input": "",
+					},
+				}),
+				s.sequence.Event("response.custom_tool_call_input.delta", map[string]any{
+					"item_id": state.itemID, "output_index": state.output,
+					"delta": state.clientInput,
+				}),
+				s.sequence.Event("response.custom_tool_call_input.done", map[string]any{
+					"item_id": state.itemID, "output_index": state.output,
+					"input": state.clientInput,
+				}),
+				s.sequence.Event("response.output_item.done", map[string]any{
+					"output_index": state.output,
+					"item": map[string]any{
+						"id": state.itemID, "type": "custom_tool_call", "status": "completed",
+						"call_id": state.id, "name": state.name, "input": state.clientInput,
+					},
+				}),
+			)
+			s.output++
+			continue
+		}
 		// Project to the client's shell schema key (Codex: "cmd"; OpenAI: "command").
 		clientArgs := s.projectArgs(state.name, state.arguments)
 		state.arguments = clientArgs
@@ -535,13 +601,51 @@ func (s *LiveStreamer) PayloadDelivered() bool {
 
 // AckContentDelivered marks text/reasoning frames as successfully written.
 // Call after a Write+Flush of non-tool payload (output_text / reasoning deltas).
+// Only counts when real text/reasoning characters exist — open-only envelopes
+// must not inflate TTFT/usage (that produced completion_tokens=1 floors).
 func (s *LiveStreamer) AckContentDelivered() {
 	if s == nil {
 		return
 	}
-	if s.text != "" || s.reasoning != "" || s.textOpen || s.reasoningOpen {
+	if s.text != "" || s.reasoning != "" {
 		s.contentDelivered = true
+		s.SyncDeliveredFromBuffers()
 	}
+}
+
+// SyncDeliveredFromBuffers sets deliveredRunes to the high-water mark of
+// buffered text/reasoning/emitted tools. Call after successful client writes.
+func (s *LiveStreamer) SyncDeliveredFromBuffers() {
+	if s == nil {
+		return
+	}
+	n := s.bufferOutputChars()
+	if n > s.deliveredRunes {
+		s.deliveredRunes = n
+	}
+}
+
+// bufferOutputChars counts buffered content without deliveredRunes (no recursion).
+func (s *LiveStreamer) bufferOutputChars() int {
+	if s == nil {
+		return 0
+	}
+	n := len([]rune(s.text)) + len([]rune(s.reasoning))
+	for _, state := range s.tools {
+		if state == nil || !(state.emitted || state.clientAcked) {
+			continue
+		}
+		n += len([]rune(state.name)) + len([]rune(state.arguments))
+	}
+	return n
+}
+
+// NoteToolDelivered recounts buffers after a successful function_call write.
+func (s *LiveStreamer) NoteToolDelivered() {
+	if s == nil {
+		return
+	}
+	s.SyncDeliveredFromBuffers()
 }
 
 // HalfOpenTools is true when any tool was framed (emitted) but never client-Ack'd.
@@ -609,27 +713,27 @@ func (s *LiveStreamer) ClientDeliveryOK() bool {
 // OutputChars counts framed text/reasoning/tool-arg runes for usage fallback.
 // Used when upstream omits the usage frame (soft-close / short tool turns) so
 // admin does not record ok=true with all-zero tokens (hollow success).
+// Prefers max(buffered content, successfully delivered runes).
 func (s *LiveStreamer) OutputChars() int {
 	if s == nil {
 		return 0
 	}
-	n := len([]rune(s.text)) + len([]rune(s.reasoning))
-	for _, state := range s.tools {
-		if state == nil || !(state.emitted || state.clientAcked) {
-			continue
-		}
-		n += len([]rune(state.name)) + len([]rune(state.arguments))
+	n := s.bufferOutputChars()
+	if s.deliveredRunes > n {
+		n = s.deliveredRunes
 	}
 	return n
 }
 
 // EstimateOutputTokens approximates completion tokens (~4 runes/token).
-// Returns at least 1 when ClientDeliveryOK-style payload exists but chars==0
-// (rare name-only tool edge); 0 when there is no client payload at all.
+// Returns at least 1 only when real client-visible characters or Ack'd payload
+// exist — never floors solely on open block flags (that caused completion=1
+// for hollow short streams).
 func (s *LiveStreamer) EstimateOutputTokens() int {
 	if s == nil {
 		return 0
 	}
+	s.SyncDeliveredFromBuffers()
 	chars := s.OutputChars()
 	if chars > 0 {
 		tok := (chars + 3) / 4
@@ -638,7 +742,8 @@ func (s *LiveStreamer) EstimateOutputTokens() int {
 		}
 		return tok
 	}
-	if s.HasClientPayload() {
+	// PayloadDelivered implies text/tools actually written; still floor at 1.
+	if s.PayloadDelivered() {
 		return 1
 	}
 	return 0
@@ -957,7 +1062,22 @@ func (s *LiveStreamer) snapshotOutput() []any {
 		}
 		itemID := state.itemID
 		if itemID == "" {
-			itemID = fmt.Sprintf("fc_%s_%d", s.responseID, index)
+			if s.isCustomTool(state.name) {
+				itemID = fmt.Sprintf("ctc_%s_%d", s.responseID, index)
+			} else {
+				itemID = fmt.Sprintf("fc_%s_%d", s.responseID, index)
+			}
+		}
+		if s.isCustomTool(state.name) {
+			input := state.clientInput
+			if input == "" {
+				input = customToolInput(state.arguments)
+			}
+			pieces = append(pieces, piece{index: outIdx, item: map[string]any{
+				"id": itemID, "type": "custom_tool_call", "status": "completed",
+				"call_id": state.id, "name": state.name, "input": input,
+			}})
+			continue
 		}
 		pieces = append(pieces, piece{index: outIdx, item: map[string]any{
 			"id": itemID, "type": "function_call", "status": "completed",
